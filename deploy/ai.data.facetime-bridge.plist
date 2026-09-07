@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>FACETIME_BRIDGE_AUTHORIZED_CALLER_E164</key>
+		<string>+15550000000</string> <!-- REPLACE with your E.164 -->
+		<key>FACETIME_BRIDGE_AUTHORIZED_CALLER_NAME</key>
+		<string>Captain Spencer</string>
+		<key>FACETIME_BRIDGE_RECORDINGS_DIR</key>
+		<string>/Users/YOURUSER/Documents/Programming/Datas_Projects/data-facetime-voice/recordings</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>ai.data.facetime-bridge</string>
+	<key>NSAppNapIsDisabled</key>
+	<true/>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/YOURUSER/.local/bin/facetime-bridge-ax2</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/YOURUSER/Documents/Programming/Datas_Projects/data-facetime-voice/logs/bridge_daemon.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/YOURUSER/Documents/Programming/Datas_Projects/data-facetime-voice/logs/bridge_daemon.log</string>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+</dict>
+</plist>

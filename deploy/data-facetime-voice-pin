@@ -1,0 +1,33 @@
+#!/bin/bash
+# Pre-dial routing pin for DATA FaceTime voice calls (2026-09-07).
+# FaceTime locks its output route at CALL START — the default output MUST be
+# BlackHole 16ch before the green button is pressed, or caller audio goes to
+# the speakers and the agent hears silence (proven by caller.wav twice).
+# Usage: data-facetime-voice-pin   (idempotent, safe to run anytime)
+#
+# 2026-09-07 16:15 addition (silent-call v11/v12 root cause): FaceTime also
+# relaunches fresh per dial and its PER-APP mic route drifts — TTS renders
+# into BlackHole 2ch, so if FaceTime's mic isn't BH2 the agent's voice dies
+# in the device (agent.wav full, Captain heard silence, daemon probe proven
+# innocent). ft_enforce_routes.scpt clicks the Video menu to force
+# mic=BH2 + output=BH16 and verifies. Must run while FaceTime is open with
+# no call active.
+set -u
+SWITCH="/opt/homebrew/bin/SwitchAudioSource"
+cur=$("$SWITCH" -c -t output 2>/dev/null)
+if [ "$cur" != "BlackHole 16ch" ]; then
+  "$SWITCH" -s "BlackHole 16ch" -t output >/dev/null 2>&1
+  new=$("$SWITCH" -c -t output 2>/dev/null)
+  echo "pinned default output: ${cur} -> ${new}"
+else
+  echo "default output already BlackHole 16ch"
+fi
+# Input must stay BH16 at all times (daemon engine clamps input format at
+# first touch to whatever the default input is).
+curin=$("$SWITCH" -c -t input 2>/dev/null)
+if [ "$curin" != "BlackHole 16ch" ]; then
+  "$SWITCH" -s "BlackHole 16ch" -t input >/dev/null 2>&1
+  echo "pinned default input: ${curin} -> BlackHole 16ch"
+fi
+# Per-app FaceTime routes (mic=BH2, output=BH16) — enforced via Video menu.
+osascript "$HOME/bin/ft_enforce_routes.scpt" 2>&1 || echo "WARN: ft_enforce_routes failed (FaceTime open? call active?)"

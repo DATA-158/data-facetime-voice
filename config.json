@@ -1,0 +1,7 @@
+{
+  "comment": "DATA FaceTime Voice — non-secret config. E164 lives in the launchd EnvironmentKeychain-backed plist or is injected at load; see README.",
+  "voice": "Siri Voice 1",
+  "silence_ms": 700,
+  "stt_model": "distil-medium.en",
+  "log_dir": "logs"
+}

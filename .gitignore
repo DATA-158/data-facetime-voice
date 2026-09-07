@@ -1,0 +1,18 @@
+# macOS runtime noise
+.DS_Store
+__pycache__/
+*.pyc
+
+# Runtime artifacts — never commit (400+ MB, contains call audio)
+logs/
+recordings/
+*.wav
+*.aiff
+
+# Local secrets — E164 lives in launchd env, NOT in the repo
+.env
+*.local.json
+outbound.trigger*
+
+# Swift bridge build artifacts (lives in sibling facetime-bridge repo)
+.build/
