@@ -773,7 +773,7 @@ def _call_timer_running() -> bool:
     import subprocess as _sp
     try:
         r = _sp.run(
-            ["/Users/data/.local/bin/facetime-bridge-ax2", "--ax-snapshot"],
+            [os.path.expanduser("~/.local/bin/facetime-bridge-ax2"), "--ax-snapshot"],
             capture_output=True, text=True, timeout=15,
             env={**os.environ, "FACETIME_BRIDGE_AUTHORIZED_CALLER_E164": AUTHORIZED_E164},
         )

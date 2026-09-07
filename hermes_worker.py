@@ -25,7 +25,7 @@ import logging
 logging.disable(logging.CRITICAL)
 
 _agent = None
-DFV_DIR = "/Users/data/Documents/Programming/Datas_Projects/data-facetime-voice"
+DFV_DIR = os.path.expanduser("~/Documents/Programming/Datas_Projects/data-facetime-voice")
 
 
 def _voice_system_prompt() -> str:
