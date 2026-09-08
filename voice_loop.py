@@ -63,6 +63,14 @@ SAMPLE_RATE_STT = 16000      # whisper + VAD
 CHUNK_MS = 20                # legacy label; actual packet cadence measured per packet
 MIN_SILENCE_MS = int(os.environ.get("DFV_SILENCE_MS", "700"))  # end-of-utterance
 SPEECH_START_MS = int(os.environ.get("DFV_SPEECH_START_MS", "60"))  # consecutive speech packets to open
+# Speculative STT: begin transcribing once the caller has been quiet this long,
+# rather than waiting out the full endpointing window first. See
+# _maybe_start_speculative_stt for why this is safe. 0 disables.
+SPECULATIVE_STT_MS = int(os.environ.get("DFV_SPECULATIVE_STT_MS", "300"))
+# How long a finalized turn will wait for an in-flight speculation before giving
+# up and transcribing itself. Sized above a normal STT decode so a slower host
+# still collects the work it already started rather than paying for it twice.
+SPECULATIVE_WAIT_MS = int(os.environ.get("DFV_SPECULATIVE_WAIT_MS", "700"))
 # Outbound trigger: the gateway (or any local client) drops a JSON file here
 # to have the warm voice service place an authorized call. Polled at TRIGGER_POLL_S
 TRIGGER_PATH = os.environ.get(
@@ -350,6 +358,12 @@ class CallSession:
         self.capture_f32_24k = queue.Queue(maxsize=500)
         self.capture_lock = threading.Lock()   # guards VAD ring buffer
         self.turn_active = threading.Semaphore(1)  # single-flight turn guard
+        # Speculative STT bookkeeping. `spec_epoch` invalidates an in-flight
+        # speculation the moment the caller starts speaking again.
+        self.spec_lock = threading.Lock()
+        self.spec_epoch = 0
+        self.spec_started = False
+        self.spec_result: tuple[int, int, str] | None = None  # (epoch, samples, text)
         self.silence_run = 0
         self.speech_run = 0
         self.in_speech = False
@@ -466,8 +480,16 @@ class CallSession:
                 if rms < 0.004:  # post-gain floor: caller noise floor ~0.003
                     self.silence_run += packet_ms
                 else:
+                    # Speech resumed — any speculation in flight is now stale.
+                    if self.silence_run and self.spec_started:
+                        self._invalidate_speculation()
                     self.silence_run = 0
                 self._last_silence_run_ms = self.silence_run
+                if (SPECULATIVE_STT_MS
+                        and not self.spec_started
+                        and self.silence_run >= SPECULATIVE_STT_MS
+                        and self.silence_run < MIN_SILENCE_MS):
+                    self._maybe_start_speculative_stt()
                 if (self.silence_run >= MIN_SILENCE_MS or
                         self.utterance_ms >= MAX_UTTERANCE_MS):
                     self._finalize_utterance()
@@ -496,37 +518,133 @@ class CallSession:
         self.utterance = []
         log.info("speech start (rms %.4f)", rms)
 
+    # ---------------- speculative STT ----------------
+    def _prepare_for_stt(self, audio: np.ndarray, trim_ms: float) -> np.ndarray | None:
+        """Trim trailing silence, normalize, downsample. None if not worth decoding."""
+        trim_samples = int(min(trim_ms, 700) / 1000.0 * SAMPLE_RATE_BRIDGE)
+        if trim_samples > 0 and len(audio) > trim_samples:
+            audio = audio[:-trim_samples]
+        if len(audio) < SAMPLE_RATE_BRIDGE * 0.25:  # <250ms
+            return None
+        peak = float(np.abs(audio).max()) if audio.size else 0.0
+        if 0.0 < peak < 0.5:
+            audio = np.clip(audio * (0.7 / peak), -1.0, 1.0)
+        f32_16k = Resampler(up=False).process(audio)
+        if float(np.sqrt(np.mean(f32_16k ** 2))) < UTTERANCE_RMS_GATE:
+            return None
+        return f32_16k
+
+    def _invalidate_speculation(self) -> None:
+        """Discard any in-flight speculation — the caller resumed speaking."""
+        with self.spec_lock:
+            self.spec_epoch += 1
+            self.spec_started = False
+            self.spec_result = None
+
+    def _maybe_start_speculative_stt(self) -> None:
+        """Transcribe the utterance-so-far during the endpointing window.
+
+        WHY THIS IS SAFE. The endpointing window is SPECULATIVE_STT_MS..
+        MIN_SILENCE_MS of pure silence — by definition no speech arrives in it,
+        or `silence_run` would have reset and invalidated this. And the finalized
+        utterance gets its trailing silence trimmed anyway, so the audio decoded
+        here is the same SPEECH the final path would decode. If anything does
+        differ, _finalize_utterance re-checks the sample count and falls back to
+        transcribing for real, so a stale speculation can never be spoken to.
+
+        The cost of being wrong is one discarded transcript. The win is that STT
+        (~250ms on the dev host, ~500ms on the live host) overlaps the silence
+        wait instead of running after it.
+        """
+        if stt is None or not self.utterance:
+            return
+        audio = np.concatenate(self.utterance)
+        prepared = self._prepare_for_stt(audio, self.silence_run)
+        if prepared is None:
+            return
+        with self.spec_lock:
+            self.spec_started = True
+            epoch = self.spec_epoch
+        n = len(prepared)
+
+        def _run() -> None:
+            try:
+                text = stt.transcribe(prepared)
+            except Exception:
+                log.exception("speculative STT failed")
+                return
+            with self.spec_lock:
+                if epoch == self.spec_epoch:
+                    self.spec_result = (epoch, n, text)
+
+        threading.Thread(target=_run, name="dfv-spec-stt", daemon=True).start()
+
+    def _claim_speculation(self) -> int | None:
+        """Snapshot the epoch to resolve against, or None if nothing is in flight.
+
+        Called from _finalize_utterance, which runs on the gRPC capture thread —
+        so it must not block. The actual waiting happens in _process_turn, which
+        has its own thread.
+        """
+        with self.spec_lock:
+            if not self.spec_started:
+                return None
+            self.spec_started = False
+            return self.spec_epoch
+
+    def _resolve_speculation(self, epoch: int, n_samples: int,
+                             timeout_s: float) -> str | None:
+        """Wait briefly for the in-flight speculation, then validate it.
+
+        Waiting beats giving up: the speculation is already partway through the
+        decode, so finishing it is strictly cheaper than starting a second one.
+        On a host where STT takes longer than the remaining endpointing window
+        this is the difference between the feature helping and it costing double.
+        """
+        deadline = time.perf_counter() + timeout_s
+        while True:
+            with self.spec_lock:
+                result = self.spec_result
+                current = self.spec_epoch
+            if current != epoch:
+                return None            # invalidated by resumed speech
+            if result is not None:
+                self.spec_result = None
+                got_epoch, got_n, text = result
+                if got_epoch != epoch:
+                    return None
+                # Guard against decoding a different span than we finalized on.
+                if abs(got_n - n_samples) > SAMPLE_RATE_STT * 0.12:  # >120ms
+                    log.info("speculation span mismatch (%d vs %d samples); "
+                             "re-transcribing", got_n, n_samples)
+                    return None
+                return text
+            if time.perf_counter() >= deadline:
+                log.info("speculation did not land within %.0fms; transcribing",
+                         timeout_s * 1000)
+                return None
+            time.sleep(0.005)
+
     def _finalize_utterance(self) -> None:
         audio = np.concatenate(self.utterance) if self.utterance else np.zeros(0)
         self.in_speech = False
         self.utterance = []
         self.silence_run = 0
-        # Tail trim: drop the trailing silence run so whisper doesn't decode
-        # dead air (2026-09-07 latency pass; ~300-500ms less to decode).
-        trim_ms = min(getattr(self, "_last_silence_run_ms", 0), 700)
-        trim_samples = int(trim_ms / 1000.0 * SAMPLE_RATE_BRIDGE)
-        if trim_samples > 0 and len(audio) > trim_samples:
-            audio = audio[:-trim_samples]
-        if len(audio) < SAMPLE_RATE_BRIDGE * 0.25:  # <250ms
-            log.info("utterance too short, dropping")
+        # Tail trim, normalize, downsample, RMS gate — shared with the
+        # speculative path so both decode exactly the same preparation.
+        f32_16k = self._prepare_for_stt(
+            audio, getattr(self, "_last_silence_run_ms", 0))
+        if f32_16k is None:
+            log.info("utterance too short or below RMS gate, dropping")
+            self._invalidate_speculation()
             return
-        # Peak-normalize for STT clarity (gain already applied live; this
-        # lifts quiet-but-present speech the rest of the way).
-        peak = float(np.abs(audio).max()) if audio.size else 0.0
-        if 0.0 < peak < 0.5:
-            audio = np.clip(audio * (0.7 / peak), -1.0, 1.0)
-        down = Resampler(up=False)
-        f32_16k = down.process(audio)
-        # RMS gate
-        rms = float(np.sqrt(np.mean(f32_16k ** 2)))
-        if rms < UTTERANCE_RMS_GATE:
-            log.info("utterance below RMS gate (%.5f), dropping", rms)
-            return
+        spec_epoch = self._claim_speculation()
         threading.Thread(
-            target=self._process_turn, args=(f32_16k,), daemon=True
+            target=self._process_turn, args=(f32_16k, spec_epoch), daemon=True
         ).start()
 
-    def _process_turn(self, f32_16k: np.ndarray) -> None:
+    def _process_turn(self, f32_16k: np.ndarray,
+                      spec_epoch: int | None = None) -> None:
         # Single-flight. Turns are spawned per finalized utterance, so two
         # utterances in quick succession used to run concurrently: both blocked
         # on _worker_lock, both queued speech into the same playback stream, and
@@ -537,12 +655,20 @@ class CallSession:
             return
         try:
             t0 = time.perf_counter()
-            text = stt.transcribe(f32_16k)
-            stt_ms = (time.perf_counter() - t0) * 1000
+            text = None
+            if spec_epoch is not None:
+                text = self._resolve_speculation(
+                    spec_epoch, len(f32_16k), SPECULATIVE_WAIT_MS / 1000.0)
+            if text is not None:
+                stt_ms, how = (time.perf_counter() - t0) * 1000, "speculative"
+            else:
+                text = stt.transcribe(f32_16k)
+                stt_ms = (time.perf_counter() - t0) * 1000
+                how = "live"
             if not text:
                 log.info("empty transcript; saying nothing")
                 return
-            log.info("Captain: %s (STT %.0fms)", text, stt_ms)
+            log.info("Captain: %s (STT %.0fms, %s)", text, stt_ms, how)
             self.playing.set()
             spoke = {"any": False}
 
