@@ -96,6 +96,19 @@ TURN_FAILED_LINE = os.environ.get(
     "DFV_TURN_FAILED_LINE",
     "Captain, I lost that one. Say again?",
 )
+# Spoken when an outbound call connects, so the Captain does not answer to dead air.
+GREETING_LINE = os.environ.get(
+    "DFV_GREETING_LINE",
+    "Captain, DATA here. The line is live — go ahead.",
+)
+# Must match hermes_worker's DFV_TOOL_FILLER — the worker chooses when to say it,
+# but the voice loop is what synthesizes it, so it preloads it here.
+TOOL_FILLER_LINE = os.environ.get("DFV_TOOL_FILLER", "Let me check that, Captain.")
+
+# Fixed lines are spoken verbatim over and over, and are often the FIRST audio of
+# a turn — on a tool turn the filler is all the caller hears until the agent loop
+# finishes. Pre-synthesizing them takes that cost off the critical path.
+PRELOAD_PHRASES = [TURN_FAILED_LINE, GREETING_LINE, TOOL_FILLER_LINE]
 
 # Silence RMS floor applied to utterance audio before STT (caller holds-open
 # mic + BlackHole loop can carry a faint DC/noise floor).
@@ -604,6 +617,7 @@ def _init_models() -> None:
     t0 = time.perf_counter()
     try:
         tts_engine.init()
+        tts_engine.preload(PRELOAD_PHRASES)
         log.info("TTS ready (%s) in %.2fs",
                  tts_engine.engine_name(), time.perf_counter() - t0)
     except Exception as e:
@@ -906,9 +920,7 @@ def _run_call(session, was_outbound: bool, stub) -> None:
         try:
             session.playing.set()
             tts_sentences(
-                split_sentences(
-                    "Captain, DATA here. The line is live — go ahead."
-                ),
+                split_sentences(GREETING_LINE),
                 emit=session._emit_speech,
                 cancelled=lambda: session.barge_in.is_set(),
             )
