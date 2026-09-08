@@ -4,6 +4,14 @@
 <dict>
 	<key>EnvironmentVariables</key>
 	<dict>
+		<!-- REQUIRED. The only number this service will dial or answer.
+		     Without it outbound dialing refuses to run. -->
+		<key>FACETIME_BRIDGE_AUTHORIZED_CALLER_E164</key>
+		<string>+15550000000</string>
+		<!-- Reasoning effort for TOOL turns. Conversational turns run with
+		     reasoning off (DFV_REASONING_EFFORT_FAST, default "none") because
+		     thinking tokens are emitted before content and are dead air on a
+		     call. -->
 		<key>DFV_REASONING_EFFORT</key>
 		<string>low</string>
 		<key>DFV_SILENCE_MS</key>
