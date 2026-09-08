@@ -1,8 +1,13 @@
-# Latency pass #2 — engineering handover
+# Latency passes #2 and #3 — engineering handover
 
 Turn latency on FaceTime Audio calls went from **30 s+ of dead air** to a measured
 **3.1–4.0 s on the live host** (1.34 s on the development host — see the note below on
-why the two differ).
+why the two differ). Pass #3 targets what remained, and should take the live host to
+roughly **2.0–2.9 s**.
+
+> **Pass #3 is PR #3 (TTS) and PR #4 (speculative STT).** This document covers both.
+> If you are reading it before those merge, the sections marked *pass #3* describe code
+> that is not on `main` yet.
 
 Most of that was not tuning. Four separate bugs were breaking calls outright, and one
 of them meant a documented optimisation had **never once executed**. The 30 s+ turns
@@ -21,10 +26,12 @@ separately-measured stages rather than observed as a single run, it says so.
 > DATA then deployed and re-measured on the **live host**, and the results differ in two
 > ways that matter:
 >
-> - **The TTS speedup is not available on the live host.** Its default voice is a Siri
->   voice, which `NSSpeechSynthesizer` cannot render, so the fidelity check fails and the
->   engine correctly stays on `say`. The voice is preserved; the 665 ms → 25 ms win is not
->   realised there. This is the designed fallback working as intended, not a defect.
+> - **The TTS speedup was not available on the live host after pass #2.** Its default
+>   voice is a Siri voice, which `NSSpeechSynthesizer` cannot render, so the fidelity
+>   check failed and the engine correctly stayed on `say`. **Pass #3 revisits exactly
+>   this**: `AVSpeechSynthesizer` is a different engine that CAN reach Siri voices, and
+>   it renders sample-identical audio. Whether it works on the live host is the single
+>   open question — the startup log answers it.
 > - **The live host runs `glm-5.3-flash` on both tiers**, per Captain directive. The LLM
 >   figures below were taken against `minimax-m3:cloud`, so treat them as showing the
 >   *shape* of the tool-schema and reasoning costs, not as predictions for that model.
@@ -35,7 +42,7 @@ separately-measured stages rather than observed as a single run, it says so.
 |---|---|---|---|
 | Time to first audio (mean) | ~7.1 s best case | 1.34 s | **3.1–4.0 s** |
 | Worst turn | 30 s+ observed | 1.72 s | — |
-| Speech synthesis, per sentence | 665 ms | 25–37 ms | 665 ms (`say` fallback) |
+| Speech synthesis, per sentence | 665 ms | 21–37 ms | 665 ms after pass #2; **~70 ms if pass #3's AV backend loads the Siri voice** |
 | Transcription | 2112 ms | 333 ms | **~500 ms** (was 1.6–2.1 s there) |
 
 The honest headline for the live host is therefore **5–8 s → 3.1–4.0 s**, with the
@@ -54,6 +61,7 @@ attributes the remaining time to provider first-token variance on tool turns.
 - [Verified, and not](#verified-and-not)
 - [Deploying and operating](#deploying-and-operating)
 - [Still to do](#still-to-do)
+- [Verifying pass #3 on your host](#verifying-pass-3-on-your-host)
 
 ---
 
@@ -89,6 +97,18 @@ AFTER   1718 ms  ####  #  ####  .
 On the live host the same budget resolves differently: STT lands at ~500 ms rather
 than 250 ms, TTS stays at 665 ms because of the `say` fallback, and the LLM stage is
 a different model — giving the measured 3.1–4.0 s mean. Endpointing is 700 ms on both.
+
+**After pass #3** that budget is expected to become, on the live host:
+
+| Stage | After pass #2 | After pass #3 |
+|---|---:|---:|
+| Endpointing | 700 ms | 700 ms — now the largest stage you control |
+| STT | ~500 ms | **~0** — hidden inside the endpointing window |
+| LLM | ~1200–2100 ms | unchanged |
+| TTS | 665 ms | **~70 ms** if the AV backend loads the Siri voice, else 665 ms |
+
+Roughly **3.1–4.0 s → 2.0–2.9 s**. These are projections: bench-host measurements
+applied to DATA's verified live-host figures, not yet measured on the live host.
 
 ### On the 30-second turns
 
@@ -229,31 +249,66 @@ startup inside `say`, and it landed on the first sentence of every single turn. 
 long-lived `NSSpeechSynthesizer` does the same sentence in 25–37 ms after a one-off
 411 ms first call.
 
+#### Three backends, tried in order
+
+Pass #2 shipped only `NSSpeechSynthesizer`, and when its fidelity check failed on
+the live host I concluded that Siri voices were simply unreachable and the speedup
+was unavailable there. **That conclusion was wrong**, and pass #3 corrects it:
+`NSSpeechSynthesizer` is the *legacy* API. `AVSpeechSynthesizer` is a different
+engine, and it reaches premium and Siri voices.
+
+| Backend | Per sentence | Siri voices | Notes |
+|---|---:|---|---|
+| `NSSpeechSynthesizer` | 21–37 ms | ✗ cannot load | fastest; tried first |
+| `AVSpeechSynthesizer` | 62–77 ms | ✓ can | also streams (303 buffers) |
+| `say` | 632–675 ms | ✓ | the floor |
+
+Order is NS → AV → say. NS is fastest so it leads; AV catches exactly the hosts
+where NS fails, which is the live host's case. Either way a host lands 10–30×
+faster than `say`.
+
+#### The fidelity gate is sample-level, not a file hash
+
 **The voice does not change, and that is enforced rather than assumed.** At startup
-`tts_engine` renders a probe phrase through both paths and compares SHA-256:
+each candidate backend renders a probe phrase, `say` renders the same phrase, both
+are decoded to raw samples, and the backend is adopted ONLY if the audio matches:
 
 ```
-say        : 159220 bytes  sha256=f0ad702a7dfdf1af…
-persistent : 159220 bytes  sha256=f0ad702a7dfdf1af…
-IDENTICAL AUDIO
+77562 samples each · max sample error 0.000000 · correlation 1.000000
 ```
 
-If they ever differ — or the voice cannot be loaded at all — it falls back to `say`
-permanently and logs why.
+Pass #2 compared SHA-256 of the output *files*. That cannot work across backends:
+`say` writes AIFF and `AVSpeechSynthesizer` emits raw float32 buffers, so a hash
+reports a false mismatch on audio that is in fact identical — and it would equally
+miss a silent voice *substitution* whenever the container happened to match.
+Comparing decoded samples is correct in both directions.
 
-> **Siri voices are restricted from `NSSpeechSynthesizer`, and the live host uses one.**
-> DATA confirmed the fidelity check fails there and the engine correctly stays on `say`.
-> The voice is preserved exactly as-is; the speedup is simply not available on that host,
-> and TTS remains 665 ms per sentence. This is the fallback doing its job.
->
-> The win is real on any host whose default voice is a standard system voice. If you want
-> it on the live host, it requires changing the default voice — which is explicitly out of
-> scope, and not a trade anyone has asked for.
+If a backend differs in any way, or the voice cannot be loaded at all, it falls back
+and logs why. There is no path in which the voice changes.
 
-One implementation note worth keeping: completion is detected by polling
-`isSpeaking()`, **not** the delegate callback. `NSSpeechSynthesizer` schedules its
-delegate on the main runloop, so a delegate never fires on a worker thread and every
-synthesis times out. This cost a debugging cycle.
+#### Two main-runloop traps, and why there is a helper process
+
+Both fast APIs signal completion only on the MAIN runloop, and the voice loop's main
+thread is busy running the service:
+
+- `NSSpeechSynthesizer` schedules its **delegate** there, so on a worker thread the
+  delegate never fires and every synthesis times out. Worked around by polling
+  `isSpeaking()` instead, which needs no runloop.
+- `AVSpeechSynthesizer`'s `writeUtterance:toBufferCallback:` has no polling
+  equivalent — on a worker thread it produces **0 buffers**, every time.
+
+Restructuring `voice_loop`'s threading around a runloop would be invasive in a
+process that also owns gRPC streams and call lifecycle. So `AVSpeechSynthesizer`
+lives in `tts_helper.py`: a small process whose main thread does nothing but pump a
+runloop and synthesize, with stdin read on a background thread. Engine init is paid
+once for the life of that process.
+
+#### Fixed lines are pre-synthesized
+
+The filler, failure and greeting lines are fixed strings spoken verbatim over and
+over — and on a tool turn the filler **is** the first audio the caller hears.
+Pre-synthesizing them at startup drops them to **0.00 ms**, measured. This helps on
+every host regardless of which backend was adopted.
 
 ### Transcription: 6.3× faster on the GPU
 
@@ -276,6 +331,50 @@ competing with TTS and the rest of the pipeline for CPU.
 
 Inference remains entirely local. The only network access is a one-time model download,
 exactly as faster-whisper already did.
+
+### Speculative STT — transcribing during the silence window *(pass #3)*
+
+Endpointing waits `MIN_SILENCE_MS` (700 ms) of silence to decide the caller is done,
+and only THEN starts transcribing. Those costs were serial for no reason: the silence
+window is, by definition, time in which no new speech arrives.
+
+Transcription now starts once the caller has been quiet for `DFV_SPECULATIVE_STT_MS`
+(default 300 ms). By the time endpointing confirms at 700 ms the transcript is usually
+already in hand.
+
+```
+before:  [speech] ---- 700ms silence ---- [STT 500ms] -> LLM
+after:   [speech] ---- 700ms silence ---- -> LLM
+                        └─ STT runs here ─┘
+```
+
+Worth ~250 ms on the bench host and ~500 ms on the live host, on every turn.
+
+**Why it is safe, which matters more than the speedup here.** This is the most
+race-prone code in the voice loop — a transcript is produced on one thread,
+invalidated from the audio callback on another, and consumed on a third:
+
+- The speculative window is pure silence. If speech resumes, `silence_run` resets and
+  the speculation is invalidated immediately (epoch bump), so a stale half-utterance
+  can never be spoken to.
+- The finalized utterance has its trailing silence trimmed anyway, so the audio
+  decoded speculatively is the same SPEECH the ordinary path decodes.
+- The result is validated on sample count before use; a span mismatch over 120 ms
+  re-transcribes for real.
+- Worst case is one discarded transcript. There is no path where a wrong transcript
+  reaches the agent.
+
+One design detail worth understanding before changing it: `_finalize_utterance` runs
+on the gRPC **capture thread** and must never block, so it only claims an epoch. The
+waiting happens in `_process_turn`, which already has its own thread. That wait
+(`DFV_SPECULATIVE_WAIT_MS`, 700 ms) collects an in-flight speculation rather than
+abandoning it — the decode is already partway done, so finishing it is strictly
+cheaper than starting a second one. On a host where STT outruns the remaining
+endpointing window, that wait is the difference between this feature helping and it
+costing double. **The live host's ~500 ms STT is exactly that case.**
+
+`test_speculative_stt.py` drives the real `on_capture` path with synthetic packets and
+asserts all three properties. Run it after any change to the VAD or endpointing.
 
 ### Two-tier tools
 
@@ -342,6 +441,8 @@ each degrades independently, and each self-tests.
 | `stt_engine.py` | All transcription. Selects MLX GPU, falls back to faster-whisper CPU, prewarms at service start. API-compatible with the old inline `STT` class. |
 | `voice_persona.py` | Just `SYSTEM_CONTEXT`, and deliberately nothing else. Zero imports, so both interpreters can read it. This is the fix for bug 04. |
 | `bench_turn.py` | The end-to-end latency harness. Uses the real splitter from `voice_loop` so it measures the same chunking production performs. |
+| `tts_helper.py` | *(pass #3)* Hosts `AVSpeechSynthesizer` in its own process, because its buffer callback only fires on the main runloop. Self-tests with `--self-test`. |
+| `test_speculative_stt.py` | *(pass #3)* Regression test for speculative STT; drives the real capture path. Exit 0 = pass. |
 
 ### Changed files
 
@@ -394,7 +495,7 @@ stopping early leaves lines in the pipe that the *next* turn reads as its own.
 | Area | Status | Evidence |
 |---|---|---|
 | STT / LLM / TTS / chunking | Verified | Component benchmarks + `bench_turn.py`, reproducible |
-| Voice fidelity vs `say` | Verified | Byte-identical SHA-256; fallback path also exercised |
+| Voice fidelity vs `say` | Verified | Sample-identical (max error 0.000000) for both fast backends; fallback path also exercised |
 | Tier routing | Verified | 19/19 on fixtures |
 | Bridge daemon under launchd | Verified | `HEALTH ready=True`, `PROBE ok=True state=idle` |
 | Full stack warm start | Verified | Both services ran; STT, TTS and worker all reported ready |
@@ -488,7 +589,12 @@ All optional except the two in step 2.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `DFV_TTS_ENGINE` | `auto` | `say` forces the old path; `native` skips the fidelity self-test |
+| `DFV_TTS_ENGINE` | `auto` | Force a backend: `ns`, `av` or `say`. Default tries NS → AV → say |
+| `DFV_TTS_CACHE_MAX` | `64` | Max pre-synthesized phrases held in memory |
+| `DFV_SPECULATIVE_STT_MS` | `300` | Silence before speculative transcription starts. **0 disables** |
+| `DFV_SPECULATIVE_WAIT_MS` | `700` | How long a turn waits to collect an in-flight speculation |
+| `DFV_GREETING_LINE` | *(DATA's greeting)* | Spoken when an outbound call connects |
+| `DFV_TOOL_FILLER` | `"Let me check that, Captain."` | Must match the worker's value; the voice loop preloads it |
 | `DFV_TTS_VOICE` | *(empty)* | Empty = system default voice. Leave it alone unless you mean it. |
 | `DFV_STT_ENGINE` | `auto` | `mlx` or `faster` to pin a backend |
 | `DFV_STT_MODEL` | `whisper-small.en-mlx` | Any MLX repo or faster-whisper name |
@@ -504,15 +610,52 @@ All optional except the two in step 2.
 
 ---
 
+## Verifying pass #3 on your host
+
+Three commands, none of which need a call:
+
+```bash
+python tts_engine.py            # which backend was adopted, and the fidelity proof
+python tts_helper.py --self-test
+python test_speculative_stt.py  # exit 0 = speculative STT is behaving
+```
+
+The line that matters most is at service start:
+
+```
+TTS engine: AVSpeechSynthesizer — voice fidelity verified vs `say`: sample-identical
+```
+
+- `AVSpeechSynthesizer` → the Siri voice IS reachable; TTS drops to ~70 ms.
+- `NSSpeechSynthesizer` → also fine, and faster still (~25 ms).
+- `say (the fallback floor)` → neither fast backend matched your voice. Nothing has
+  changed for you, the voice is intact, and TTS stays at 665 ms. Not a failure —
+  that is the gate doing its job.
+
+Then per turn, `Captain: "…" (STT 0ms, speculative)` means the speculation is landing;
+`(STT 500ms, live)` means it is not, and the threshold needs tuning on real audio.
+
+---
+
 ## Still to do
 
-1. **Endpointing is now the largest stage** at a flat 700 ms — 52 % of a good turn.
-   Silero VAD is already a dependency and would support ~400–500 ms safely. The
-   existing note that 500 ms fragments speech was measured against the *energy* VAD, so
-   it does not rule this out.
+1. **Make a live call before optimising further.** Nothing downstream of FaceTime's
+   dial and answer has ever run — the rewritten `_place_call_direct`, barge-in, and VAD
+   endpointing on real audio are all unproven. Two questions the logs will answer that
+   no synthetic benchmark can: does `rms` on real FaceTime audio land anywhere near the
+   0.006 trigger with `CAPTURE_GAIN=10`, and does the STT line read `speculative` or
+   `live` when the Captain speaks at a natural pace? If it reads `live` every turn, the
+   300 ms threshold needs real-call tuning and pass #3's STT win is not being realised.
 
-2. **Speculative STT.** Begin transcribing at the onset of silence rather than after it
-   is confirmed, and STT leaves the critical path almost entirely.
+2. **Endpointing, at a flat 700 ms, is now the largest stage anyone controls** — and
+   the next big win is *semantic* endpointing: pass #3 already produces a transcript at
+   300 ms, so it can decide whether the caller actually finished ("…around six?" is
+   complete; "I was thinking about" is not) and finalize early. Worth ~300 ms on most
+   turns, and it costs nothing extra because the transcript is already there.
+
+   **Do not build this before a live call.** Getting it wrong means cutting the Captain
+   off mid-sentence, and every VAD number in this project so far came from synthetic
+   `say` audio through a fake capture path. Tune it on real-call telemetry.
 
 3. **Tool turns still run 1–7 s behind the filler.** Trimming the voice toolset, or a
    second filler when the answer runs long, would close the gap.
