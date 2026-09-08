@@ -1,24 +1,46 @@
 # Latency pass #2 — engineering handover
 
-Turn latency on FaceTime Audio calls went from **30 s+ of dead air** to **~1.4 s**.
+Turn latency on FaceTime Audio calls went from **30 s+ of dead air** to a measured
+**3.1–4.0 s on the live host** (1.34 s on the development host — see the note below on
+why the two differ).
 
 Most of that was not tuning. Four separate bugs were breaking calls outright, and one
-of them meant a documented optimisation had **never once executed**.
+of them meant a documented optimisation had **never once executed**. The 30 s+ turns
+were eliminated by those fixes, not by the speedups.
 
 This document records what was measured, what was wrong, what changed and why, and
 what is still unproven. Read [Verified, and not](#verified-and-not) carefully — the
 FaceTime-dependent paths have not been exercised against a live call.
 
-Every number here was measured on an M-series MacBook Air, not estimated. Where a
-figure is reconstructed from separately-measured stages rather than observed as a
-single run, it says so.
+Every number here was measured, not estimated. Where a figure is reconstructed from
+separately-measured stages rather than observed as a single run, it says so.
 
-| | Before | After |
-|---|---|---|
-| Time to first audio (mean) | ~7.1 s best case | **1.34 s** |
-| Worst turn | 30 s+ observed | **1.72 s** |
-| Speech synthesis, per sentence | 665 ms | **25–37 ms** |
-| Transcription | 2112 ms | **333 ms** |
+> ### Two hosts, two sets of numbers — read this first
+>
+> The development benchmarks were taken on an M-series MacBook Air (the "bench host").
+> DATA then deployed and re-measured on the **live host**, and the results differ in two
+> ways that matter:
+>
+> - **The TTS speedup is not available on the live host.** Its default voice is a Siri
+>   voice, which `NSSpeechSynthesizer` cannot render, so the fidelity check fails and the
+>   engine correctly stays on `say`. The voice is preserved; the 665 ms → 25 ms win is not
+>   realised there. This is the designed fallback working as intended, not a defect.
+> - **The live host runs `glm-5.3-flash` on both tiers**, per Captain directive. The LLM
+>   figures below were taken against `minimax-m3:cloud`, so treat them as showing the
+>   *shape* of the tool-schema and reasoning costs, not as predictions for that model.
+>
+> Where the two disagree, **the live host is the number that counts.**
+
+| | Before | Bench host | Live host (DATA, verified) |
+|---|---|---|---|
+| Time to first audio (mean) | ~7.1 s best case | 1.34 s | **3.1–4.0 s** |
+| Worst turn | 30 s+ observed | 1.72 s | — |
+| Speech synthesis, per sentence | 665 ms | 25–37 ms | 665 ms (`say` fallback) |
+| Transcription | 2112 ms | 333 ms | **~500 ms** (was 1.6–2.1 s there) |
+
+The honest headline for the live host is therefore **5–8 s → 3.1–4.0 s**, with the
+worst-case 30 s+ turns eliminated by the bug fixes rather than by the speedups. DATA
+attributes the remaining time to provider first-token variance on tool turns.
 
 ---
 
@@ -62,7 +84,11 @@ AFTER   1718 ms  ####  #  ####  .
 | **Total** | **7067 ms** | **1718 ms** | Mean across three turns: **1339 ms** |
 
 `BEFORE` is reconstructed from per-stage measurements. `AFTER` is measured end to end
-(`bench_turn.py`), worst of three turns.
+(`bench_turn.py`), worst of three turns, **on the bench host**.
+
+On the live host the same budget resolves differently: STT lands at ~500 ms rather
+than 250 ms, TTS stays at 665 ms because of the `say` fallback, and the LLM stage is
+a different model — giving the measured 3.1–4.0 s mean. Endpointing is 700 ms on both.
 
 ### On the 30-second turns
 
@@ -215,9 +241,14 @@ IDENTICAL AUDIO
 If they ever differ — or the voice cannot be loaded at all — it falls back to `say`
 permanently and logs why.
 
-> **Siri voices are restricted from `NSSpeechSynthesizer`.** If your default is one,
-> expect the fidelity check to fail: you keep your voice exactly as-is and simply forgo
-> the speedup on that host. Confirm which branch you land on from the log.
+> **Siri voices are restricted from `NSSpeechSynthesizer`, and the live host uses one.**
+> DATA confirmed the fidelity check fails there and the engine correctly stays on `say`.
+> The voice is preserved exactly as-is; the speedup is simply not available on that host,
+> and TTS remains 665 ms per sentence. This is the fallback doing its job.
+>
+> The win is real on any host whose default voice is a standard system voice. If you want
+> it on the live host, it requires changing the default voice — which is explicitly out of
+> scope, and not a trade anyone has asked for.
 
 One implementation note worth keeping: completion is detected by polling
 `isSpeaking()`, **not** the delegate callback. `NSSpeechSynthesizer` schedules its
@@ -236,6 +267,8 @@ All timings against the same 6.79 s utterance, best of three:
 | MLX, GPU | `whisper-base.en` | 125 ms | available if you want more headroom |
 | **MLX, GPU** | **`whisper-small.en`** | **333 ms** | **now the default** — and more accurate |
 | MLX, GPU | `distil-large-v3` | 1019 ms | still beats the old CPU path |
+
+On the **live host** DATA measured MLX at **~500 ms**, down from 1.6–2.1 s on CPU there. Slower than the bench host's 333 ms, but the same 3–4× improvement.
 
 Two things worth carrying forward. `cpu_threads` was a footgun — the obvious "make it
 faster" knob made the old path 50 % slower. And moving STT to the GPU means it stops
@@ -369,6 +402,21 @@ stopping early leaves lines in the pipe that the *next* turn reads as its own.
 | Barge-in | **Unverified** | Needs a live call |
 | Rewritten `_place_call_direct` | **Unverified** | Never run against a live dial — **watch this first** |
 
+### Verified again on the live host
+
+DATA re-ran verification after deploying (merge `193c808`) and confirmed independently:
+
+- Syntax clean across all changed files.
+- `AUTHORIZED_E164` double-getenv fixed, and **fail-closed confirmed** — an empty value
+  refuses to dial rather than dialling `None`.
+- Both FAST and FULL tiers resolve to `glm-5.3-flash` per the config default.
+- TTS fidelity check **failed and correctly kept `say`** (Siri default voice).
+- MLX STT installed and measured at ~500 ms.
+- `bench_turn.py` on that host: **mean 3.1–4.0 s** time-to-first-audio.
+- Service restarted and warm; STT `mlx` ready, TTS `say` ready, both workers warm.
+
+The FaceTime-dependent rows above remain unverified on either host.
+
 ### A false alarm you will hit
 
 `facetime-bridge doctor` reports `accessibility: unavailable` even when the grant is
@@ -469,8 +517,12 @@ All optional except the two in step 2.
 3. **Tool turns still run 1–7 s behind the filler.** Trimming the voice toolset, or a
    second filler when the answer runs long, would close the gap.
 
-4. **A live call has not happened.** The three unverified rows above, in order of risk.
+4. **TTS on the live host is still 665 ms/sentence** — the largest single remaining
+   stage there, and untouchable without changing the default voice. If that constraint
+   ever relaxes, this is the biggest available win on that machine.
 
-5. **`config.json` is read by nothing.** It advertises `distil-medium.en` and
+5. **A live call has not happened.** The three unverified rows above, in order of risk.
+
+6. **`config.json` is read by nothing.** It advertises `distil-medium.en` and
    `Siri Voice 1`, neither of which is in effect. Either wire it up or delete it — as it
    stands it is actively misleading.
