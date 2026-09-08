@@ -74,6 +74,13 @@ def main() -> int:
     t0 = time.perf_counter()
     stt = STT()
     tts_engine.init()
+    # Production preloads the fixed lines at service start; do the same here so
+    # the tool-turn filler is measured as it actually behaves on a call.
+    try:
+        from voice_loop import PRELOAD_PHRASES
+        tts_engine.preload(PRELOAD_PHRASES)
+    except Exception:
+        pass
     print(f"  STT={stt.engine_name()}  TTS={tts_engine.engine_name()}  "
           f"({time.perf_counter()-t0:.1f}s)")
 
