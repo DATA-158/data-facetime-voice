@@ -37,6 +37,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent))
 import facetime_media_pb2 as pb
 import facetime_media_pb2_grpc as pb_grpc
+import tts_engine
 
 # ----------------------------------------------------------------------------
 # Configuration
@@ -49,10 +50,12 @@ LOG_PATH = os.environ.get(
     "DFV_LOG_PATH",
     str(Path(__file__).parent / "logs" / "facetime_voice.log"),
 )
-# 2026-09-07: must be .venv-native-tts (has grpc, dotenv, numpy, faster_whisper
-# AND imports the hermes-agent tree cleanly). The gateway venv lacks grpc, and
-# hermes_worker imports voice_loop (for SYSTEM_CONTEXT) which imports grpc.
-HERMES_VENV = os.path.expanduser("~/agent-calling/.venv-native-tts/bin/python")
+# The worker runs under the HERMES venv (needs the hermes-agent tree); the
+# voice loop itself runs under the AUDIO venv (grpc/mlx/whisper/pyobjc). They
+# are usually different interpreters, so this must be host-configurable rather
+# than a hardcoded path that silently breaks the worker on any other machine.
+HERMES_VENV = os.environ.get(
+    "HERMES_VENV", os.path.expanduser("~/agent-calling/.venv-native-tts/bin/python"))
 WORKER_SCRIPT = str(Path(__file__).parent / "hermes_worker.py")
 
 SAMPLE_RATE_BRIDGE = 24000  # daemon contract
@@ -65,15 +68,34 @@ SPEECH_START_MS = int(os.environ.get("DFV_SPEECH_START_MS", "60"))  # consecutiv
 TRIGGER_PATH = os.environ.get(
     "DFV_TRIGGER_PATH", os.path.expanduser("~/.facetime-bridge/outbound.trigger")
 )
-TRIGGER_POLL_S = float(os.environ.get("DFV_TRIGGER_POLL_S", "2.0"))
+# 2026-09-07: was 2.0s. This interval is dead time between "DATA, call me" and
+# the dial actually starting, on every outbound call, for no benefit — the poll
+# is a single stat() on a path that almost never exists.
+TRIGGER_POLL_S = float(os.environ.get("DFV_TRIGGER_POLL_S", "0.25"))
 # The only number this system will ever dial or answer (fail-closed, mirrors
 # the bridge daemon's FACETIME_BRIDGE_AUTHORIZED_CALLER_E164 contract).
-AUTHORIZED_E164 = os.environ.get(
-    os.environ.get("FACETIME_BRIDGE_AUTHORIZED_CALLER_E164", "")
-)
+#
+# 2026-09-07 BUGFIX: this was a double lookup —
+#     os.environ.get(os.environ.get("FACETIME_BRIDGE_AUTHORIZED_CALLER_E164", ""))
+# which reads the env var *named by* the phone number and therefore always
+# evaluated to None. Consequences, both confirmed: the dial URL became the
+# literal "facetime-audio://None", and _call_timer_running() passed None into
+# subprocess(env=...) which raises TypeError, was swallowed by its bare except,
+# and so ALWAYS reported "not connected" — forcing every outbound call through
+# the blind 60s/90s timeout branches. That was the "calling takes minutes" bug.
+AUTHORIZED_E164 = os.environ.get("FACETIME_BRIDGE_AUTHORIZED_CALLER_E164", "").strip()
 MAX_UTTERANCE_MS = 30_000
-TTS_VOICE = os.environ.get("DFV_TTS_VOICE", "")  # empty = system default voice (Siri — Captain's pick, confirmed better by A/B test)
+# Voice selection now lives in tts_engine (it owns synthesis). Empty = the
+# system default voice — the Captain's pick, and not to be changed.
+TTS_VOICE = tts_engine.TTS_VOICE
 MAX_TURNS = 200
+
+# Spoken when a turn yields nothing sayable. A live call must never go silent:
+# the caller cannot see the log, so an audible failure beats dead air.
+TURN_FAILED_LINE = os.environ.get(
+    "DFV_TURN_FAILED_LINE",
+    "Captain, I lost that one. Say again?",
+)
 
 # Silence RMS floor applied to utterance audio before STT (caller holds-open
 # mic + BlackHole loop can carry a faint DC/noise floor).
@@ -135,41 +157,21 @@ class Resampler:
 
 
 # ----------------------------------------------------------------------------
-# STT — faster-whisper (distil-medium.en, int8, ARM64 CPU)
+# STT — MLX GPU whisper, faster-whisper CPU fallback (see stt_engine.py)
 # ----------------------------------------------------------------------------
-class STT:
-    def __init__(self):
-        from faster_whisper import WhisperModel
-        self.model = WhisperModel(
-            os.environ.get("DFV_STT_MODEL", "distil-small.en"),
-            device="auto",
-            compute_type="int8",
-            cpu_threads=int(os.environ.get("DFV_STT_THREADS", "6")),
-            download_root=os.path.expanduser("~/.cache/dfv-whisper"),
-        )
-
-    def transcribe(self, f32_16k: np.ndarray) -> str:
-        segments, _info = self.model.transcribe(
-            f32_16k, language="en", vad_filter=False, beam_size=1,
-            condition_on_previous_text=False,
-        )
-        return " ".join(s.text.strip() for s in segments).strip()
+# 2026-09-07 latency pass #2: the CPU model took 2112ms on a 6.8s utterance,
+# fully serial ahead of the LLM. The same work on the Apple Silicon GPU is
+# 333ms and transcribes more accurately. Inference stays entirely local.
+from stt_engine import STT  # noqa: E402
 
 
 # ----------------------------------------------------------------------------
 # LLM — persistent Hermes worker (true DATA: persona, memory, tools)
 # ----------------------------------------------------------------------------
-SYSTEM_CONTEXT = """You are DATA, the right-hand AI agent for Captain Kirk (Spencer). The Captain is speaking to you over a live FaceTime Audio call, through a real-time voice pipeline (STT -> you -> TTS).
-
-COMMUNICATION RULES:
-- Speak like DATA talks: calm, precise, dry wit. "Sir" or "Captain" once per reply, max.
-- Voice-friendly: NO markdown, NO code blocks, NO tables, NO URLs. Plain spoken sentences.
-- SHORT: 1-3 sentences by default. The Captain can ask for more.
-- Never say you are an AI language model. Never apologize for being AI.
-- If asked to DO something (calendar, reminders, notes, fitness log, GitHub, web search), DO IT with your tools immediately, then confirm briefly what you did.
-
-YOU HAVE FULL TOOL ACCESS (auto-approved). Key tools: terminal, web_search, read_file, write_file, calendar/notes/reminders skills, fitness DB at ~/.hermes/fitness_tracker.db, GitHub via gh (org SpencerSmithSite), session_search for past conversations.
-"""
+# DATA's persona lives in voice_persona (dependency-free) so hermes_worker
+# can import it under a different interpreter without dragging in the audio
+# stack. Re-exported here so existing references keep working.
+from voice_persona import SYSTEM_CONTEXT  # noqa: E402,F401
 
 _worker_proc = None
 _worker_lock = threading.Lock()
@@ -258,55 +260,65 @@ class TTSCanceled(Exception):
 
 
 def tts_sentences(sentences: list[str], emit, cancelled) -> None:
-    """Synthesize each sentence with `say` as WAVE LEI16@24000, emit directly.
+    """Synthesize each sentence and emit it at the bridge's 24 kHz.
 
-    2026-09-07 latency pass: LEI16@24000 (measured 1294ms vs 3301ms for AIFF,
-    2.5x) AND it is the bridge's native rate — the old 16k->24k resample chain
-    is gone entirely. /dev/stdout + FIFO streaming both fail (error -54 / fifo
-    open blocks); file-per-sentence stays the transport.
+    2026-09-07 latency pass #2: synthesis moved to tts_engine, which holds ONE
+    persistent NSSpeechSynthesizer instead of spawning `say` per sentence.
+    `say` pays ~665ms of speech-engine init on EVERY invocation regardless of
+    text length (measured 654-718ms over 10 identical runs; bare process spawn
+    is 4ms) and that landed on time-to-first-audio for every sentence. The
+    persistent engine does the same work in 25-37ms.
+
+    The VOICE IS UNCHANGED — tts_engine verifies byte-identical output against
+    `say` at startup and falls back to `say` permanently if it ever differs.
     """
-    import tempfile
     for sentence in sentences:
         if cancelled():
             raise TTSCanceled()
         clean = sentence.strip()
         if not clean:
             continue
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
-            path = tf.name
-        try:
-            say_cmd = [
-                "say", "-o", path,
-                "--file-format=WAVE", "--data-format=LEI16@24000",
-            ]
-            if TTS_VOICE:
-                say_cmd += ["-v", TTS_VOICE]
-            say_cmd += ["--", clean]
-            subprocess.run(say_cmd, check=True, capture_output=True, timeout=30)
-            import soundfile as sf
-            audio, sr = sf.read(path, dtype="float32", always_2d=False)
-            if audio.ndim > 1:
-                audio = audio.mean(axis=1)
-            if abs(sr - SAMPLE_RATE_BRIDGE) > 1:
-                r = Resampler(up=True)
-                r.ratio = SAMPLE_RATE_BRIDGE / sr
-                audio = r.process(audio)
-            if cancelled():
-                raise TTSCanceled()
-            emit(audio, is_first=True)
-        finally:
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+        audio = tts_engine.synthesize(clean)
+        if cancelled():
+            raise TTSCanceled()
+        emit(audio, is_first=True)
 
 
-def _pop_sentences(buf: str) -> tuple[list[str], str]:
-    """Pop complete sentences off a growing delta buffer (streaming TTS)."""
-    out = []
+_SENTENCE_BOUNDARY = ".!?…"
+_CLAUSE_BOUNDARY = ",;:—–"
+# The first chunk of a turn may break at a CLAUSE once it is at least this long.
+# Long enough that we never ship a chopped fragment ("Well,"), short enough to
+# get audio moving. Later chunks always wait for a full sentence, which reads
+# better and costs nothing — by then playback is already ahead of synthesis.
+MIN_FIRST_CHUNK_CHARS = int(os.environ.get("DFV_MIN_FIRST_CHUNK", "24"))
+
+
+def _is_real_boundary(buf: str, idx: int) -> bool:
+    """Reject punctuation that is not a speech boundary: 3.5, 1,000, e.g."""
+    prev_c = buf[idx - 1] if idx > 0 else " "
+    next_c = buf[idx + 1] if idx + 1 < len(buf) else " "
+    if prev_c.isdigit() and next_c.isdigit():
+        return False          # decimal point or thousands separator
+    return True
+
+
+def _pop_sentences(buf: str, allow_clause: bool = False) -> tuple[list[str], str]:
+    """Pop speakable chunks off a growing delta buffer (streaming TTS).
+
+    2026-09-07 latency pass #2: this used to split ONLY on .!?… so a reply that
+    opened with a long clause — measured live: "Honestly, Captain, I can't argue
+    with the logic — an evening run clears the head..." — held all audio for
+    3.8s waiting on the first period. With TTS now at ~40ms/chunk there is no
+    reason to wait: `allow_clause` lets the FIRST chunk of a turn break at a
+    comma or dash once it has enough words to sound deliberate.
+    """
+    out: list[str] = []
     start = 0
     for idx, ch in enumerate(buf):
-        if ch in ".!?…":
+        is_sentence = ch in _SENTENCE_BOUNDARY
+        is_clause = (allow_clause and not out and ch in _CLAUSE_BOUNDARY
+                     and (idx - start) >= MIN_FIRST_CHUNK_CHARS)
+        if (is_sentence or is_clause) and _is_real_boundary(buf, idx):
             out.append(buf[start:idx + 1])
             start = idx + 1
     return out, buf[start:]
@@ -324,6 +336,7 @@ class CallSession:
         self.barge_in = threading.Event()
         self.capture_f32_24k = queue.Queue(maxsize=500)
         self.capture_lock = threading.Lock()   # guards VAD ring buffer
+        self.turn_active = threading.Semaphore(1)  # single-flight turn guard
         self.silence_run = 0
         self.speech_run = 0
         self.in_speech = False
@@ -501,6 +514,14 @@ class CallSession:
         ).start()
 
     def _process_turn(self, f32_16k: np.ndarray) -> None:
+        # Single-flight. Turns are spawned per finalized utterance, so two
+        # utterances in quick succession used to run concurrently: both blocked
+        # on _worker_lock, both queued speech into the same playback stream, and
+        # whichever finished first cleared the OTHER turn's barge_in flag. The
+        # result was overlapping replies and barge-in that stopped working.
+        if not self.turn_active.acquire(blocking=False):
+            log.info("turn already in flight; dropping overlapping utterance")
+            return
         try:
             t0 = time.perf_counter()
             text = stt.transcribe(f32_16k)
@@ -510,21 +531,38 @@ class CallSession:
                 return
             log.info("Captain: %s (STT %.0fms)", text, stt_ms)
             self.playing.set()
+            spoke = {"any": False}
+
+            def _speak(sentence: str, is_final: bool = False) -> None:
+                spoke["any"] = True
+                self._speak_sentence(sentence, is_final=is_final)
+
             try:
                 # Streaming turn: first sentence speaks while the model is
                 # still generating the rest (2026-09-07 latency pass).
                 llm_reply_streaming(
                     text,
-                    speak=self._speak_sentence,
+                    speak=_speak,
                     cancelled=lambda: self.barge_in.is_set(),
                 )
             except TTSCanceled:
                 log.info("TTS canceled by barge-in")
+            except Exception:
+                # Worker died, stream broke, JSON was malformed — the caller is
+                # still on the line and must hear something.
+                log.exception("turn failed mid-stream")
+                if not spoke["any"] and not self.barge_in.is_set():
+                    try:
+                        self._speak_sentence(TURN_FAILED_LINE, is_final=True)
+                    except Exception:
+                        log.exception("fallback line failed to speak")
             finally:
                 self.playing.clear()
                 self.barge_in.clear()
         except Exception:
             log.exception("turn failed")
+        finally:
+            self.turn_active.release()
 
     def _speak_sentence(self, sentence: str, is_final: bool = False) -> None:
         """TTS one sentence and emit it (streaming turn path)."""
@@ -537,41 +575,60 @@ class CallSession:
             log.exception("sentence TTS failed")
 
     def _emit_speech(self, f32_24k: np.ndarray, is_first: bool = False) -> None:
+        pcm = f32_to_pcm16(f32_24k)
         if RECORDINGS_DIR and self.rec_writer_agent is not None:
             try:
-                self.rec_writer_agent.writeframes(f32_to_pcm16(f32_24k))
+                self.rec_writer_agent.writeframes(pcm)
             except Exception:
-                answer_file = None
-        self.writer.put(("PLAYBACK", f32_to_pcm16(f32_24k)))
+                log.debug("agent recording write failed", exc_info=True)
+        self.writer.put(("PLAYBACK", pcm))
 
 
 stt: STT | None = None
 
 
 def _init_models() -> None:
+    """Load and prewarm STT + TTS. Every first-call cost belongs HERE.
+
+    Both engines have a large one-time cost (MLX model load and graph build,
+    NSSpeechSynthesizer's 411ms first synthesis). Paying them at service start
+    is the difference between a normal first turn and the 'why was his first
+    reply so slow' complaint.
+    """
     global stt
-    log.info("loading whisper…")
+    t0 = time.perf_counter()
+    log.info("loading STT…")
     stt = STT()
-    log.info("whisper ready")
-    # TTS engine pre-warm (agent-calling report item 5): first `say` spawn in
-    # a boot session costs ~1s extra; burn it here, not on Captain's turn.
+    log.info("STT ready (%s) in %.2fs", stt.engine_name(), time.perf_counter() - t0)
+
+    t0 = time.perf_counter()
     try:
-        import tempfile, subprocess as _sp
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as _tf:
-            _p = _tf.name
-        _sp.run(["say", "-o", _p, "--file-format=WAVE",
-                 "--data-format=LEI16@24000", "--", "."],
-                check=True, capture_output=True, timeout=15)
-        os.unlink(_p)
-        log.info("tts prewarmed")
+        tts_engine.init()
+        log.info("TTS ready (%s) in %.2fs",
+                 tts_engine.engine_name(), time.perf_counter() - t0)
     except Exception as e:
-        log.warning("tts prewarm failed: %s", e)
+        log.warning("tts init failed: %s", e)
 
 
 def _warm_worker() -> None:
+    """Warm the worker WITHOUT polluting the call transcript.
+
+    This used to go through llm_reply(), which appends both the ping and its
+    reply to _dialogue. Every call therefore began with a synthetic
+    "System ping."/"ready." exchange that was written into the transcript and
+    fed to the post-call memory summarizer — and left _dialogue non-empty, so
+    persist_call_memory() fired even for calls where nobody said anything.
+    """
     try:
         t0 = time.perf_counter()
-        llm_reply("System ping. Reply with the single word: ready.")
+        with _worker_lock:
+            _ensure_worker()
+            _worker_proc.stdin.write(json.dumps(
+                {"prompt": "System ping. Reply with the single word: ready."}) + "\n")
+            _worker_proc.stdin.flush()
+            line = _worker_proc.stdout.readline()
+        if not line:
+            raise RuntimeError("worker gave no response to warm ping")
         log.info("worker warm: %.2fs", time.perf_counter() - t0)
     except Exception as e:
         log.warning("worker warmup failed (will retry on first call): %s", e)
@@ -677,39 +734,77 @@ def _place_call_direct(stub) -> "object | None":
       in the AX snapshot ('FaceTime Audio M:SS' with a nonzero/updating time).
     """
     import subprocess as _sp
+    if not AUTHORIZED_E164:
+        log.error("FACETIME_BRIDGE_AUTHORIZED_CALLER_E164 is unset — refusing to "
+                  "dial. Set it in the launchd plist for ai.data.facetime-voice.")
+        return None
     url = f"facetime-audio://{AUTHORIZED_E164}"
+    t_dial = time.time()
     try:
         _sp.run(["open", url], check=True, timeout=15)
     except Exception as e:
         log.error("URL open failed: %s", e)
         return None
 
-    # Press any 'Click to Call' prompt (appears within ~10s if macOS wants
-    # confirmation), then wait for the Phone call surface.
+    # 2026-09-07 latency pass. The old loop called BOTH expensive AX probes once
+    # per second for up to 90s:
+    #   - _press_click_to_call_if_present() runs an AppleScript that walks
+    #     `entire contents of` every Notification Center UI element. That is one
+    #     of the slowest calls in the AX API and it ran every iteration until it
+    #     succeeded, so the "1s poll" was really seconds per turn of the loop and
+    #     it hammered the AX subsystem while the call was trying to come up.
+    #   - _call_timer_running() spawns the AX snapshot binary each time.
+    # Now: pgrep is the fast poll (4ms), the Click-to-Call press is attempted a
+    # bounded number of times inside the window where the prompt actually
+    # appears, and the timer probe only runs once the Phone surface exists.
+    CLICK_TO_CALL_WINDOW_S = 20.0   # prompt appears within ~10s if at all
+    CLICK_TO_CALL_TRIES = 3
+    TIMER_PROBE_EVERY_S = 1.5
+    BLIND_CONNECT_AFTER_S = 12.0    # was 60s of dead air on a live call
     deadline = time.time() + 90.0
-    pressed_prompt = False
+
+    presses = 0
+    next_press_at = t_dial + 3.0
     phone_seen_at = None
+    next_timer_probe = 0.0
+
     while time.time() < deadline:
-        if not pressed_prompt:
-            pressed_prompt = _press_click_to_call_if_present()
-        if _sp.run(["pgrep", "-x", "Phone"], capture_output=True).returncode == 0:
+        now = time.time()
+
+        if (phone_seen_at is None and presses < CLICK_TO_CALL_TRIES
+                and now >= next_press_at
+                and now - t_dial < CLICK_TO_CALL_WINDOW_S):
+            presses += 1
+            if _press_click_to_call_if_present():
+                presses = CLICK_TO_CALL_TRIES  # pressed; stop traversing AX
+            next_press_at = time.time() + 5.0
+
+        phone_up = _sp.run(["pgrep", "-x", "Phone"],
+                           capture_output=True).returncode == 0
+        if phone_up:
             if phone_seen_at is None:
-                phone_seen_at = time.time()
-                log.info("Phone call surface appeared")
-            # The surface may exist while still dialing; the call is truly
-            # live when the timer text appears. Give it up to 60s.
-            if _call_timer_running():
-                log.info("outbound call connected (timer running)")
+                phone_seen_at = now
+                log.info("Phone call surface appeared (%.1fs after dial)",
+                         now - t_dial)
+            if now >= next_timer_probe:
+                next_timer_probe = now + TIMER_PROBE_EVERY_S
+                if _call_timer_running():
+                    log.info("outbound call connected (timer running, %.1fs after dial)",
+                             time.time() - t_dial)
+                    return _ProbeLike("connected")
+            # Fallback only if the timer probe can't confirm. With the
+            # AUTHORIZED_E164 bug fixed the probe works, so this should be rare.
+            if now - phone_seen_at > BLIND_CONNECT_AFTER_S:
+                log.warning("Phone surface up %.0fs without a readable timer — "
+                            "treating as connected (check facetime-bridge-ax "
+                            "Accessibility permission)", BLIND_CONNECT_AFTER_S)
                 return _ProbeLike("connected")
-            if time.time() - phone_seen_at > 60.0:
-                log.info("Phone surface up 60s without timer — treating as connected")
-                return _ProbeLike("connected")
-        else:
-            if phone_seen_at is not None:
-                # Surface appeared then vanished — call ended/failed.
-                log.info("Phone surface vanished before connect")
-                return None
-        time.sleep(1.0)
+        elif phone_seen_at is not None:
+            # Surface appeared then vanished — call ended/failed.
+            log.info("Phone surface vanished before connect")
+            return None
+
+        time.sleep(0.25)
     log.warning("outbound connect wait timed out after 90s")
     return None
 
@@ -768,14 +863,25 @@ def _press_click_to_call_if_present() -> bool:
 
 
 def _call_timer_running() -> bool:
-    """True when the AX snapshot shows a running call timer (live call)."""
+    """True when the AX snapshot shows a running call timer (live call).
+
+    2026-09-07: was silently always-False. AUTHORIZED_E164 was None (see the
+    constant above), and subprocess rejects a None env value with TypeError,
+    which the bare `except` swallowed. Now the env value is guaranteed a str,
+    and a genuine probe failure is logged instead of being indistinguishable
+    from "no timer" — the difference between them cost 60s on every dial.
+    """
     import json as _json
     import subprocess as _sp
+    ax = os.path.expanduser("~/.local/bin/facetime-bridge-ax2")
+    if not os.path.exists(ax):
+        ax = os.path.expanduser("~/.local/bin/facetime-bridge-ax")
     try:
         r = _sp.run(
-            [os.path.expanduser("~/.local/bin/facetime-bridge-ax2"), "--ax-snapshot"],
-            capture_output=True, text=True, timeout=15,
-            env={**os.environ, "FACETIME_BRIDGE_AUTHORIZED_CALLER_E164": AUTHORIZED_E164},
+            [ax, "--ax-snapshot"],
+            capture_output=True, text=True, timeout=8,
+            env={**os.environ,
+                 "FACETIME_BRIDGE_AUTHORIZED_CALLER_E164": AUTHORIZED_E164 or ""},
         )
         surfaces = _json.loads(r.stdout or "[]")
         for s in surfaces:
@@ -785,7 +891,8 @@ def _call_timer_running() -> bool:
                 if "FaceTime Audio" in t and any(c.isdigit() for c in t):
                     return True
         return False
-    except Exception:
+    except Exception as e:
+        log.warning("call-timer probe failed (%s): %s", type(e).__name__, e)
         return False
 
 
@@ -915,7 +1022,14 @@ def llm_reply_streaming(user_text: str, speak, cancelled) -> str:
     t0 = time.perf_counter()
     collected: list[str] = []
     buf = ""
-    spoke_any = False
+    # Two distinct facts, and conflating them is a bug: `spoke_reply` gates
+    # "has the model's ACTUAL answer been voiced yet" (a filler must not
+    # suppress the real answer on a tool turn, where content arrives only at
+    # the end), while `spoke_anything` gates "did the caller hear ANY audio"
+    # for the never-go-silent guard.
+    spoke_reply = False
+    spoke_anything = False
+    tier = "fast"
     with _worker_lock:
         _ensure_worker()
         _worker_proc.stdin.write(json.dumps({
@@ -927,34 +1041,66 @@ def llm_reply_streaming(user_text: str, speak, cancelled) -> str:
             if not line:
                 raise RuntimeError("worker died mid-stream")
             msg = json.loads(line)
+            if "filler" in msg:
+                # The worker routed this turn to the tool-enabled agent, which
+                # streams nothing until its whole loop finishes. Speak now so
+                # the caller hears acknowledgement instead of dead air.
+                filler = (msg.get("filler") or "").strip()
+                if filler:
+                    tier = "full"
+                    spoke_anything = True
+                    speak(filler, is_final=False)
+                continue
             if "delta" in msg:
                 buf += msg["delta"]
-                sentences, buf = _pop_sentences(buf)
+                # Only the turn's first chunk may break early at a clause.
+                sentences, buf = _pop_sentences(buf, allow_clause=not spoke_reply)
                 for s in sentences:
                     collected.append(s)
                     if s.strip():
-                        spoke_any = True
+                        spoke_reply = True
+                        spoke_anything = True
                         speak(s.strip(), is_final=False)
             elif "content" in msg or "error" in msg:
                 if msg.get("error"):
                     log.warning("worker stream error: %s", msg["error"])
+                tier = msg.get("tier", tier)
                 final = (msg.get("content") or "").strip()
                 # Any completed sentences never streamed as deltas (tool turns
                 # emit only the final content) — speak the whole thing now.
-                if not spoke_any and final:
+                if not spoke_reply and final:
                     speak(final, is_final=True)
+                    spoke_reply = True
+                    spoke_anything = True
                 if final and not collected:
                     collected.append(final)
                 tail = buf.strip()
                 if tail:
                     collected.append(tail)
                     speak(tail, is_final=True)
+                    spoke_anything = True
+                # NEVER GO SILENT. 2026-09-07: on a worker error `final` is ""
+                # and every branch above was skipped, so nothing was spoken —
+                # but the transcript still recorded the "came back empty" line
+                # below, which made the logs look like a completed turn while
+                # the Captain heard pure dead air. That is the "sometimes he
+                # just never says anything" failure. An audible failure is
+                # always better than silence on a live call.
+                if not spoke_anything:
+                    log.error("turn produced no speakable text (error=%s) — "
+                              "speaking audible fallback", msg.get("error"))
+                    try:
+                        speak(TURN_FAILED_LINE, is_final=True)
+                    except TTSCanceled:
+                        raise
+                    except Exception:
+                        log.exception("even the fallback line failed to speak")
                 break
     elapsed = time.perf_counter() - t0
     text = " ".join(collected).strip() or "I'm here, Captain, but my response came back empty."
     with _dialogue_lock:
         _dialogue.append({"role": "assistant", "content": text})
-    log.info("streaming turn: %.2fs, %d chars", elapsed, len(text))
+    log.info("streaming turn [%s tier]: %.2fs, %d chars", tier, elapsed, len(text))
     return text
 
 
@@ -1154,7 +1300,7 @@ def main() -> int:
         except Exception as e:
             log.warning("audio_default routing failed: %s", e)
         try:
-                    _run_call(session, was_outbound, stub)
+            _run_call(session, was_outbound, stub)
         finally:
             # Captain's standing requirement (2026-09-07): call content must
             # survive the hangup — transcript + memory entry, every call.
