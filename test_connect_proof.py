@@ -19,6 +19,7 @@ Run:  python test_connect_proof.py     (exit 0 = pass)
 import json
 import os
 import sys
+import time
 import unittest
 from unittest import mock
 
@@ -318,5 +319,259 @@ def t6_no_mlx_import():
 run("6. import stays MLX-free", t6_no_mlx_import)
 
 
-print("\n" + ("ALL CHECKS PASSED" if ok else "FAILURES ABOVE"))
-sys.exit(0 if ok else 1)
+# ---------------------------------------------------------------------------
+# 2026-09-09 silent-call fixes (bugs 1-3)
+# ---------------------------------------------------------------------------
+
+def t7_press_gate_runs_without_surface():
+    """Bug 1: presses fire from t_dial+3s even with Phone already up.
+
+    The morning call (2026-09-09 06:54): Phone's surface appeared 0.4s after
+    dial, so the old `phone_seen_at is None` gate was False forever and zero
+    press attempts ran during the whole 90s window.
+    """
+    import threading
+    clock = {"t": 1000.0}
+    t0 = clock["t"]
+    press_at = []
+
+    def fake_press():
+        press_at.append(clock["t"] - t0)
+        return False
+
+    def fake_time():
+        return clock["t"]
+
+    def bump(s):
+        clock["t"] += 0.5
+
+    with mock.patch.object(vl, "AUTHORIZED_E164", "+15550000000"), \
+         mock.patch("os.path.exists", return_value=True), \
+         mock.patch("subprocess.run", return_value=run_result(returncode=0)), \
+         mock.patch.object(vl, "_press_click_to_call_if_present",
+                           side_effect=fake_press), \
+         mock.patch.object(vl, "_call_timer_running", return_value=False), \
+         mock.patch.object(vl, "_in_call_banner_visible", return_value=False), \
+         mock.patch.object(vl, "_click_to_call_prompt_visible",
+                           return_value=True), \
+         mock.patch.object(vl.time, "time", fake_time), \
+         mock.patch.object(vl.time, "sleep", bump):
+        result = []
+        done = threading.Event()
+
+        def target():
+            try:
+                result.append(vl._place_call_direct(stub=None))
+            except Exception as e:  # pragma: no cover
+                result.append(e)
+            finally:
+                done.set()
+
+        th = threading.Thread(target=target, daemon=True)
+        th.start()
+        assert done.wait(30), "dial loop did not terminate"
+
+    r = result[0]
+    assert r is None, f"expected None at deadline (no proof), got {r!r}"
+    assert len(press_at) == 3, f"expected exactly 3 press attempts, got {press_at}"
+    assert all(dt < 20.0 for dt in press_at), f"presses outside window: {press_at}"
+    assert press_at[0] < 4.0, f"first press not at ~t_dial+3s: {press_at}"
+    print(f"  Phone up at 0s did NOT block presses: attempts at "
+          f"{[round(x, 1) for x in press_at]}s after dial")
+
+
+def t8_adopt_proof_helper():
+    """Bug 2: adopt requires timer/banner proof; probe failures never raise."""
+    import threading
+    # (a) timer proof short-circuits -> True, banner not consulted.
+    with mock.patch.object(vl, "_call_timer_running", return_value=True) as mt, \
+         mock.patch.object(vl, "_in_call_banner_visible",
+                           return_value=False) as mb:
+        assert vl._adopt_connect_proof(stub=None, timeout_s=1.0) is True
+        assert mt.called, "timer proof never probed"
+        assert not mb.called, "banner probed although the timer already proved"
+    print("  timer proof -> adopt allowed (banner not needed)")
+
+    # (b) no proof at all -> keeps polling until timeout, then False.
+    clock = {"t": 0.0}
+    calls = {"n": 0}
+
+    def no_proof():
+        calls["n"] += 1
+        return False
+
+    with mock.patch.object(vl, "_call_timer_running", side_effect=no_proof), \
+         mock.patch.object(vl, "_in_call_banner_visible", return_value=False), \
+         mock.patch.object(vl.time, "time", lambda: clock["t"]), \
+         mock.patch.object(vl.time, "sleep", lambda s: clock.__setitem__(
+             "t", clock["t"] + 1.1)):
+        assert vl._adopt_connect_proof(stub=None, timeout_s=2.2) is False
+    assert calls["n"] >= 2, "proof helper stopped polling before timeout"
+    print(f"  no proof -> polled {calls['n']}x then failed safe (False)")
+
+    # (c) probes RAISING -> swallowed, still fails safe, never raises.
+    clock2 = {"t": 0.0}
+    with mock.patch.object(vl, "_call_timer_running",
+                           side_effect=RuntimeError("boom")), \
+         mock.patch.object(vl.time, "time", lambda: clock2["t"]), \
+         mock.patch.object(vl.time, "sleep", lambda s: clock2.__setitem__(
+             "t", clock2["t"] + 1.1)):
+        assert vl._adopt_connect_proof(stub=None, timeout_s=1.1) is False
+    print("  probe exceptions -> swallowed, fails safe")
+run("7. prompt-press gate no longer blocked by Phone surface", t7_press_gate_runs_without_surface)
+run("8. adopt requires connect proof, never raises", t8_adopt_proof_helper)
+
+
+def t9_bh2_tap_fail_open():
+    """Bug 3 helper: broken tap returns (0.0, 0.0); working tap returns peak."""
+    import types
+    import numpy as np
+    saved = sys.modules.get("sounddevice")
+
+    class FakeStreamOK:
+        def __init__(self, **kwargs):
+            assert kwargs["device"] == "BlackHole 2ch"
+            assert kwargs["samplerate"] == 48000 and kwargs["channels"] == 2
+            assert kwargs["dtype"] == "float32" and kwargs["blocksize"] == 960
+            self._cb = kwargs["callback"]
+
+        def __enter__(self):
+            blk = np.zeros((960, 2), dtype="float32")
+            blk[:, :] = 0.25
+            self._cb(blk, 960, 0.0, None)
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def _install(cls):
+        m = types.ModuleType("sounddevice")
+        m.InputStream = cls
+        sys.modules["sounddevice"] = m
+
+    def _restore():
+        if saved is not None:
+            sys.modules["sounddevice"] = saved
+        else:
+            sys.modules.pop("sounddevice", None)
+
+    try:
+        _install(FakeStreamOK)
+        with mock.patch.object(vl.time, "sleep", lambda s: None):
+            peak, rms = vl._bh2_tap_peak(3.0)
+        assert (round(peak, 6), round(rms, 6)) == (0.25, 0.25), (peak, rms)
+
+        class FakeStreamBoom:
+            def __init__(self, **kwargs):
+                raise RuntimeError("boom")
+
+        _install(FakeStreamBoom)
+        with mock.patch.object(vl.time, "sleep", lambda s: None):
+            peak, rms = vl._bh2_tap_peak(3.0)
+        assert (peak, rms) == (0.0, 0.0), "hard failure must fail-open"
+    finally:
+        _restore()
+    print("  BH2 tap: correct device/format, (0.25,0.25) on signal, "
+          "fail-open on error")
+run("9. BH2 tap helper works and never raises", t9_bh2_tap_fail_open)
+
+
+def t10_run_call_bh2_selfcheck():
+    """Bug 3 wiring: dead leg -> ERROR + audible warning; healthy -> pass line;
+    flag off -> tap never runs (trigger path unchanged)."""
+    import threading
+    import grpc
+
+    class FakeRpcError(grpc.RpcError):
+        def code(self):
+            return "UNAVAILABLE"
+
+    class FakeWriter:
+        def __init__(self):
+            self.items = []
+
+        def put(self, item):
+            self.items.append(item)
+
+    class FakeSession:
+        def __init__(self):
+            self.playing = threading.Event()
+            self.barge_in = threading.Event()
+            self.writer = FakeWriter()
+            self.emitted = []
+
+        def _emit_speech(self, pcm):
+            self.emitted.append(len(pcm))
+
+        def audio_loop(self):
+            time.sleep(60)  # daemon thread; never joined in tests
+
+    stub = mock.Mock()
+    stub.Control.side_effect = FakeRpcError()  # ends the call watcher at once
+    spoken = []
+
+    def fake_tts(sentences, emit=None, cancelled=None):
+        spoken.append(" ".join(sentences))
+
+    # (a) dead leg -> greeting + warning, ERROR logged.
+    with mock.patch.object(vl, "tts_sentences", fake_tts), \
+         mock.patch.object(vl, "_bh2_tap_peak", lambda seconds=3.0: (0.0, 0.0)), \
+         mock.patch.object(vl.log, "error") as err:
+        vl._run_call(FakeSession(), True, stub, bh2_selfcheck=True)
+    assert len(spoken) == 2, f"expected greeting + warning, got {spoken}"
+    assert "audio leg" in spoken[1], spoken[1]
+    assert err.called and "playback leg dead" in str(err.call_args), \
+        "ERROR line for the dead playback leg missing"
+    print("  dead BH2 leg -> ERROR 'playback leg dead' + audible warning")
+
+    # (b) healthy leg -> greeting only, no ERROR.
+    spoken.clear()
+    with mock.patch.object(vl, "tts_sentences", fake_tts), \
+         mock.patch.object(vl, "_bh2_tap_peak",
+                           lambda seconds=3.0: (0.5, 0.2)), \
+         mock.patch.object(vl.log, "error") as err:
+        vl._run_call(FakeSession(), True, stub, bh2_selfcheck=True)
+    assert len(spoken) == 1, f"healthy leg must not warn, got {spoken}"
+    assert not err.called, "false ERROR on a healthy leg"
+    print("  healthy BH2 leg (peak 0.5) -> no warning, no ERROR")
+
+    # (c) flag off -> tap never runs (outbound-trigger path stays unchanged).
+    spoken.clear()
+    with mock.patch.object(vl, "tts_sentences", fake_tts), \
+         mock.patch.object(vl, "_bh2_tap_peak",
+                           side_effect=AssertionError("tap ran with flag off")):
+        vl._run_call(FakeSession(), True, stub, bh2_selfcheck=False)
+    assert len(spoken) == 1, spoken
+    print("  bh2_selfcheck=False -> tap never invoked")
+run("10. _run_call BH2 self-check wiring", t10_run_call_bh2_selfcheck)
+
+
+def t11_adopt_block_wiring():
+    """Bug 2 wiring: proof gate precedes adoption; unmute + selfcheck present."""
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "voice_loop.py")).read()
+    i_proof = src.find("if not _adopt_connect_proof(stub):")
+    i_adopt = src.find('"adopting live call (warm attach — no cold start)"')
+    i_flag = src.find("bh2_selfcheck=True")
+    assert i_proof != -1, "adopt connect-proof gate missing"
+    assert i_adopt != -1, "adopt log line missing"
+    assert i_flag != -1, "adopt path does not request the BH2 self-check"
+    assert i_proof < i_adopt < i_flag, "adopt wiring order wrong (proof->adopt->flag)"
+    n_unmute = src.count("_ensure_outbound_mic_unmuted()")
+    assert n_unmute == 2, \
+        f"unmute must run exactly on trigger + adopt paths, found {n_unmute}"
+    print("  adopt path wiring: proof gate -> unmute -> bh2_selfcheck=True")
+run("11. adopt block wiring (proof, unmute, selfcheck)", t11_adopt_block_wiring)
+
+
+# pytest-compat: module-level checks above run at import; the unittest bridge
+# below lets pytest collect a real test that reflects the ok flag, while the
+# direct script run keeps its documented `python test_connect_proof.py` exit.
+class SilentCallRegression(unittest.TestCase):
+    def test_all_checks_passed(self):
+        self.assertTrue(ok, "one or more checks failed — see output above")
+
+
+if __name__ == "__main__":
+    print("\n" + ("ALL CHECKS PASSED" if ok else "FAILURES ABOVE"))
+    sys.exit(0 if ok else 1)

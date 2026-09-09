@@ -112,11 +112,19 @@ GREETING_LINE = os.environ.get(
 # Must match hermes_worker's DFV_TOOL_FILLER — the worker chooses when to say it,
 # but the voice loop is what synthesizes it, so it preloads it here.
 TOOL_FILLER_LINE = os.environ.get("DFV_TOOL_FILLER", "Let me check that, Captain.")
+# Spoken best-effort when the post-greeting BlackHole 2ch tap finds the playback
+# leg dead (2026-09-09 silent adopted call). It may not transmit if the leg is
+# truly dead — the point is the log ground truth plus a chance the caller hears it.
+PLAYBACK_WARN_LINE = os.environ.get(
+    "DFV_PLAYBACK_WARN_LINE",
+    "Captain, my audio leg looks dead — call back or switch to iMessage.",
+)
 
 # Fixed lines are spoken verbatim over and over, and are often the FIRST audio of
 # a turn — on a tool turn the filler is all the caller hears until the agent loop
 # finishes. Pre-synthesizing them takes that cost off the critical path.
-PRELOAD_PHRASES = [TURN_FAILED_LINE, GREETING_LINE, TOOL_FILLER_LINE]
+PRELOAD_PHRASES = [TURN_FAILED_LINE, GREETING_LINE, TOOL_FILLER_LINE,
+                   PLAYBACK_WARN_LINE]
 
 # Silence RMS floor applied to utterance audio before STT (caller holds-open
 # mic + BlackHole loop can carry a faint DC/noise floor).
@@ -787,6 +795,43 @@ def _open_recorders(call_id: str):
     return caller, agent
 
 
+def _bh2_tap_peak(seconds: float = 3.0) -> "tuple[float, float]":
+    """Tap BlackHole 2ch for `seconds` and return (peak, rms) of what lands there.
+
+    2026-09-09 (silent-call bug 3): the adopted call's BH2 tap recorded peak
+    0.0000 for the whole call window while greeting + two TTS turns were
+    synthesized — the playback leg died and nothing proved it until the
+    offline tap analysis. This is the in-call version of /tmp/bh2_tap.py
+    (same device/format contract: BH2 at 48k stereo float32, blocksize 960).
+    Fail-open by design: any error returns (0.0, 0.0) and logs — a broken
+    self-check must never kill the call path.
+    """
+    try:
+        import sounddevice as sd
+        chunks: list = []
+
+        def _cb(indata, frames, t, status):
+            chunks.append(indata.copy())
+
+        with sd.InputStream(device="BlackHole 2ch", samplerate=48000,
+                            channels=2, dtype="float32", callback=_cb,
+                            blocksize=960):
+            time.sleep(max(0.1, seconds))
+        if not chunks:
+            log.warning("BH2 tap captured no audio blocks")
+            return 0.0, 0.0
+        a = np.concatenate(chunks, axis=0)
+        peak = float(np.abs(a).max())
+        rms = float(np.sqrt((a ** 2).mean()))
+        log.info("BH2 tap: %.1fs peak=%.4f rms=%.4f",
+                 a.shape[0] / 48000.0, peak, rms)
+        return peak, rms
+    except Exception as e:
+        # NEVER raise: the tap is diagnostic, not load-bearing.
+        log.warning("BH2 tap failed (%s): %s", type(e).__name__, e)
+        return 0.0, 0.0
+
+
 # ----------------------------------------------------------------------------
 # Outbound call triggers (file-based; consumed by the warm voice service)
 # ----------------------------------------------------------------------------
@@ -1048,12 +1093,24 @@ def _place_call_direct(stub) -> "object | None":
     while time.time() < deadline:
         now = time.time()
 
-        if (phone_seen_at is None and presses < CLICK_TO_CALL_TRIES
+        # 2026-09-09 (silent-call bug 1): the old gate required
+        # phone_seen_at is None, but Phone spawns ~0.4s after dial — so the
+        # condition was False forever and NO prompt press ever ran (zero
+        # ax-press lines in the whole 90s window; the call sat unanswered
+        # until a manual click). Presses run from t_dial+3s regardless of
+        # surface presence; budget and window still cap the effort.
+        if (presses < CLICK_TO_CALL_TRIES
                 and now >= next_press_at
                 and now - t_dial < CLICK_TO_CALL_WINDOW_S):
             presses += 1
-            if _press_click_to_call_if_present():
+            pressed = _press_click_to_call_if_present()
+            if pressed:
                 presses = CLICK_TO_CALL_TRIES  # pressed; stop traversing AX
+            # 2026-09-09: today's call produced ZERO press lines in the log —
+            # every attempt outcome must be visible or the gate stays
+            # undebuggable.
+            log.info("prompt press attempt %d/%d: %s", presses, CLICK_TO_CALL_TRIES,
+                     "pressed" if pressed else "nothing to press (will retry)")
             next_press_at = time.time() + 5.0
 
         phone_up = _sp.run(["pgrep", "-x", "Phone"],
@@ -1335,13 +1392,33 @@ def _ensure_outbound_mic_unmuted(session=None) -> str:
     return state
 
 
-def _run_call(session, was_outbound: bool, stub) -> None:
+def _run_call(session, was_outbound: bool, stub,
+              bh2_selfcheck: bool = False) -> None:
     """Greeting (outbound), audio loop, and end-watcher for one call."""
     # Outbound calls connect with the callee hearing dead air (the loop
     # is otherwise mute until they speak first). Speak immediately so
     # Captain knows the line is live — three 2026-09-06 flights ended
     # with him answering into silence and hanging up.
     if was_outbound:
+        # 2026-09-09 (silent-call bug 3): the adopted call's TTS never
+        # reached BlackHole 2ch — the /tmp/bh2_tap.wav recorded peak 0.0000
+        # for the whole window while greeting + two TTS turns were
+        # synthesized. Self-check: tap BH2 WHILE the greeting plays (tapping
+        # after it finished would read silence even on a healthy, now-idle
+        # leg); if it stays silent, log the ground truth and speak an
+        # audible warning. Fail-open, once per call, adopt path only.
+        tap = {"peak": None}
+        tap_th = None
+        if bh2_selfcheck:
+            def _tap_bh2():
+                try:
+                    tap["peak"] = _bh2_tap_peak(3.0)[0]
+                except Exception:
+                    tap["peak"] = 0.0
+            tap_th = threading.Thread(target=_tap_bh2, daemon=True)
+            tap_th.start()
+        greeted = False
+        barged = False
         try:
             session.playing.set()
             tts_sentences(
@@ -1349,11 +1426,45 @@ def _run_call(session, was_outbound: bool, stub) -> None:
                 emit=session._emit_speech,
                 cancelled=lambda: session.barge_in.is_set(),
             )
+            greeted = True
         except TTSCanceled:
+            barged = True
             log.info("greeting canceled by barge-in")
         finally:
             session.playing.clear()
             session.barge_in.clear()
+        if tap_th is not None:
+            tap_th.join(timeout=5.0)
+            if tap_th.is_alive():
+                log.warning("BH2 tap thread did not finish — self-check skipped")
+            elif barged or not greeted:
+                log.info("BH2 self-check skipped (greeting barged-in or "
+                         "failed; tap peak=%s)", tap["peak"])
+            elif tap["peak"] is None:
+                log.warning("BH2 tap produced no reading — self-check skipped")
+            elif tap["peak"] < 0.005:
+                log.error("BH2 silent after greeting — playback leg dead "
+                          "(peak=%.4f)", tap["peak"])
+                # Best-effort audible warning via the normal TTS path — it
+                # may not transmit on a dead leg, but the ERROR line above
+                # is the ground truth this check exists to capture.
+                try:
+                    session.playing.set()
+                    tts_sentences(
+                        split_sentences(PLAYBACK_WARN_LINE),
+                        emit=session._emit_speech,
+                        cancelled=lambda: session.barge_in.is_set(),
+                    )
+                except TTSCanceled:
+                    log.info("playback warning canceled by barge-in")
+                except Exception as e:
+                    log.warning("playback warning failed to speak: %s", e)
+                finally:
+                    session.playing.clear()
+                    session.barge_in.clear()
+            else:
+                log.info("BH2 playback self-check passed (peak=%.4f)",
+                         tap["peak"])
 
     # run until the call ends
     t = threading.Thread(target=session.audio_loop, daemon=True)
@@ -1541,6 +1652,34 @@ def llm_reply_streaming(user_text: str, speak, cancelled) -> str:
     return text
 
 
+def _adopt_connect_proof(stub, timeout_s: float = 30.0) -> bool:
+    """Wait for REAL connect proof before adopting a probe-'connected' call.
+
+    2026-09-09 (silent-call bug 2): this morning's ghost — the probe read
+    'connected' while the call was still RINGING (no in-call banner or timer
+    ever existed), the loop adopted 114ms after the failed placement cleaned
+    up, and the audio stream attached to a call that later transitioned.
+    PROBE 'connected' alone is not proof (same class as the 09-07 lesson:
+    verify a call with the AX snapshot before trusting the probe). Adopt
+    only when the ax snapshot shows a running call timer OR pressable
+    in-call banner controls; keep polling up to `timeout_s`, then fail safe
+    (do not adopt).
+    """
+    t0 = time.time()
+    while True:
+        try:
+            if _call_timer_running() or _in_call_banner_visible():
+                return True
+        except Exception as e:
+            # A probe hiccup must not wedge adoption — keep polling until
+            # the timeout, then fail safe.
+            log.warning("adopt connect-proof probe failed (%s): %s",
+                        type(e).__name__, e)
+        if time.time() - t0 >= timeout_s:
+            return False
+        time.sleep(1.0)
+
+
 def main() -> int:
     _ensure_log_dir()
     os.makedirs(os.path.dirname(SOCKET_PATH), exist_ok=True)
@@ -1619,6 +1758,17 @@ def main() -> int:
                 # an outbound call on this socket can only be to the
                 # authorized E164 (daemon fails closed), so connected is proof.
                 if pr.state == "connected":
+                    # 2026-09-09 (silent-call bug 2): this morning the loop
+                    # adopted a RINGING call on the probe's word alone — the
+                    # probe read 'connected' with no in-call banner/timer
+                    # (ghost) — and attached the audio stream 114ms after the
+                    # failed placement cleaned up. Require REAL connect proof
+                    # (timer or in-call banner) before attaching; fail safe
+                    # to non-adoption.
+                    if not _adopt_connect_proof(stub):
+                        log.warning("probe says connected but no timer/banner "
+                                    "proof in 30s — NOT adopting (ghost?)")
+                        continue
                     log.info("adopting live call (warm attach — no cold start)")
                     in_call = True
                     call_id = f"dfv-adopt-{int(time.time())}"
@@ -1635,8 +1785,17 @@ def main() -> int:
                             log.info("default output %s -> BlackHole 16ch (adopt)", saved_output)
                     except Exception as e:
                         log.warning("audio_default routing failed: %s", e)
+                    # 2026-09-09 (silent-call bug 2): this morning's adopted
+                    # call came up mic-muted and nobody called the unmute
+                    # helper on the adopt path — Captain heard total silence.
+                    # Mirror the outbound-trigger path: exactly once per call,
+                    # never raises.
+                    _ensure_outbound_mic_unmuted()
                     try:
-                        _run_call(session, True, stub)
+                        # bh2_selfcheck: the tap-proven bug-3 ground truth —
+                        # on the adopted call BH2 peaked 0.0000 for the whole
+                        # window while TTS was queued. Fail-open, once per call.
+                        _run_call(session, True, stub, bh2_selfcheck=True)
                     finally:
                         try:
                             if _dialogue:
@@ -1741,7 +1900,10 @@ def main() -> int:
         except Exception as e:
             log.warning("audio_default routing failed: %s", e)
         try:
-            _run_call(session, was_outbound, stub)
+            # 2026-09-09 (silent-call bug 3): the trigger path gets the same
+            # ground-truth self-check as the adopt path — a trigger-placed
+            # call can die on the playback leg exactly like today's ghost.
+            _run_call(session, was_outbound, stub, bh2_selfcheck=True)
         finally:
             # Captain's standing requirement (2026-09-07): call content must
             # survive the hangup — transcript + memory entry, every call.
