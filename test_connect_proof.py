@@ -477,7 +477,9 @@ run("9. BH2 tap helper works and never raises", t9_bh2_tap_fail_open)
 
 
 def t10_run_call_bh2_selfcheck():
-    """Bug 3 wiring: dead leg -> ERROR + audible warning; healthy -> pass line;
+    """Bug 3 wiring + live-call-2 regression: dead leg (after audio flowed)
+    -> ERROR + audible warning; healthy -> pass line; no audio emitted ->
+    distinct 'skipped' WARNING (NEVER the false 'playback leg dead' ERROR);
     flag off -> tap never runs (trigger path unchanged)."""
     import threading
     import grpc
@@ -499,9 +501,13 @@ def t10_run_call_bh2_selfcheck():
             self.barge_in = threading.Event()
             self.writer = FakeWriter()
             self.emitted = []
+            self.first_emit = threading.Event()
 
         def _emit_speech(self, pcm):
             self.emitted.append(len(pcm))
+            # Mirror the real hook: the FIRST emission arms the tap.
+            if not self.first_emit.is_set():
+                self.first_emit.set()
 
         def audio_loop(self):
             time.sleep(60)  # daemon thread; never joined in tests
@@ -512,8 +518,10 @@ def t10_run_call_bh2_selfcheck():
 
     def fake_tts(sentences, emit=None, cancelled=None):
         spoken.append(" ".join(sentences))
+        if emit is not None:
+            emit(b"\x00\x01")  # greeting flows -> first_emit set, as in-call
 
-    # (a) dead leg -> greeting + warning, ERROR logged.
+    # (a) dead leg AFTER audio emitted -> greeting + warning, ERROR logged.
     with mock.patch.object(vl, "tts_sentences", fake_tts), \
          mock.patch.object(vl, "_bh2_tap_peak", lambda seconds=3.0: (0.0, 0.0)), \
          mock.patch.object(vl.log, "error") as err:
@@ -522,7 +530,7 @@ def t10_run_call_bh2_selfcheck():
     assert "audio leg" in spoken[1], spoken[1]
     assert err.called and "playback leg dead" in str(err.call_args), \
         "ERROR line for the dead playback leg missing"
-    print("  dead BH2 leg -> ERROR 'playback leg dead' + audible warning")
+    print("  dead BH2 leg (audio was flowing) -> ERROR + audible warning")
 
     # (b) healthy leg -> greeting only, no ERROR.
     spoken.clear()
@@ -535,6 +543,26 @@ def t10_run_call_bh2_selfcheck():
     assert not err.called, "false ERROR on a healthy leg"
     print("  healthy BH2 leg (peak 0.5) -> no warning, no ERROR")
 
+    # (b2) LIVE CALL 2 REGRESSION: no audio ever emitted (stream never
+    # flushed) -> tap must NOT log 'playback leg dead'; it logs the distinct
+    # 'no audio emitted yet' WARNING instead.
+    spoken.clear()
+    with mock.patch.object(vl, "tts_sentences",
+                           lambda s, emit=None, cancelled=None: None), \
+         mock.patch.object(vl, "_bh2_tap_peak",
+                           side_effect=AssertionError("tap ran with no audio")), \
+         mock.patch.object(vl, "DFV_FIRST_EMIT_WAIT_S", 0.05), \
+         mock.patch.object(vl.log, "error") as err, \
+         mock.patch.object(vl.log, "warning") as warn:
+        vl._run_call(FakeSession(), True, stub, bh2_selfcheck=True)
+    assert len(spoken) == 0, spoken
+    assert not err.called, \
+        "false 'playback leg dead' ERROR when no audio was emitted yet"
+    msgs = [str(c) for c in warn.call_args_list]
+    assert any("no audio emitted yet" in m for m in msgs), msgs
+    print("  no audio emitted -> 'self-check skipped: no audio emitted yet' "
+          "WARNING, no false ERROR")
+
     # (c) flag off -> tap never runs (outbound-trigger path stays unchanged).
     spoken.clear()
     with mock.patch.object(vl, "tts_sentences", fake_tts), \
@@ -544,6 +572,177 @@ def t10_run_call_bh2_selfcheck():
     assert len(spoken) == 1, spoken
     print("  bh2_selfcheck=False -> tap never invoked")
 run("10. _run_call BH2 self-check wiring", t10_run_call_bh2_selfcheck)
+
+
+def t12_selfcheck_starts_on_first_emit():
+    """Bug A wiring: audio_loop starts BEFORE the greeting (START packet must
+    precede TTS), _emit_speech sets first_emit on the FIRST packet, and the
+    tap thread only samples after that event (no tap-before-audio race)."""
+    import threading
+    import numpy as np
+
+    class FakeWriter:
+        def __init__(self):
+            self.items = []
+
+        def put(self, item):
+            self.items.append(item)
+
+    session = vl.CallSession(stub=None, call_id="t12")
+    session.writer = FakeWriter()
+
+    # _emit_speech arms first_emit on the first packet only.
+    assert not session.first_emit.is_set()
+    session._emit_speech(np.zeros(4, dtype="float32"))
+    assert session.first_emit.is_set(), "first emit must arm the tap"
+    session._emit_speech(np.zeros(4, dtype="float32"))
+    print("  _emit_speech sets first_emit on first packet")
+
+    # _run_call must start audio_loop BEFORE the greeting: patch audio_loop
+    # to record order AND queue the START packet exactly like the real one.
+    import grpc
+
+    class FakeRpcError(grpc.RpcError):
+        def code(self):
+            return "UNAVAILABLE"
+
+    stub = mock.Mock()
+    stub.Control.side_effect = FakeRpcError()
+
+    order = []
+
+    def fake_audio_loop(self):
+        order.append("audio_loop")
+        self.writer.put(("START", None))
+
+    def fake_tts(sentences, emit=None, cancelled=None):
+        order.append("greeting")
+
+    with mock.patch.object(vl.CallSession, "audio_loop", fake_audio_loop), \
+         mock.patch.object(vl, "tts_sentences", fake_tts):
+        vl._run_call(session, True, stub, bh2_selfcheck=False)
+    assert order[:2] == ["audio_loop", "greeting"], \
+        f"audio stream must attach before the greeting, got {order}"
+    assert any(item[0] == "START" for item in session.writer.items), \
+        "audio_loop must have queued the START packet before the greeting"
+    print("  audio_loop (START packet) precedes the greeting")
+
+
+def t13_bargein_releases_guard_promptly():
+    """Bug B: TTSCanceled must end the turn quickly — llm_reply_streaming
+    stops reading deltas, drains to the terminator, raises; the worker pipe
+    ends clean (no cross-turn poisoning) and is not killed."""
+    import json as _json
+
+    class FakeStdout:
+        def __init__(self, lines):
+            self._lines = list(lines)
+
+        def readline(self):
+            return self._lines.pop(0) if self._lines else ""
+
+    class FakeWorkerProc:
+        """Worker stand-in: 1000 buffered delta lines then the terminator."""
+
+        def __init__(self):
+            msgs = [{"delta": f"chunk {i} "} for i in range(1000)]
+            msgs.append({"content": "final", "tier": "fast"})
+            self.stdout = FakeStdout(_json.dumps(m) + "\n" for m in msgs)
+            self.stdin = mock.Mock()
+            self.killed = False
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            self.killed = True
+
+    proc = FakeWorkerProc()
+    saved_proc = vl._worker_proc
+    vl._worker_proc = proc
+    try:
+        with mock.patch.object(vl, "_ensure_worker", lambda: None):
+            t0 = time.perf_counter()
+            try:
+                vl.llm_reply_streaming("hello", speak=lambda s, is_final=False: None,
+                                       cancelled=lambda: True)
+                raise AssertionError("expected TTSCanceled")
+            except vl.TTSCanceled:
+                pass
+            dt = time.perf_counter() - t0
+        # The turn abandoned speech at the first delta and drained the
+        # remaining buffered lines to the terminator — fast, and the
+        # terminator was read (not left to poison the next turn).
+        assert dt < 5.0, f"canceled turn took {dt:.2f}s — guard held too long"
+        assert proc.killed is False, \
+            "healthy pipe must not be killed by the drain"
+        assert vl._worker_proc is proc, "worker must survive a clean drain"
+        with vl._dialogue_lock:
+            last = vl._dialogue[-1] if vl._dialogue else None
+            vl._dialogue.clear()
+        assert last and last["content"] == "[turn canceled by barge-in]", last
+    finally:
+        vl._worker_proc = saved_proc
+    print(f"  canceled turn released in {dt * 1000:.0f}ms, drained to "
+          f"terminator, worker kept")
+
+    # (b) THE EXACT CALL-2 SIGNATURE: speak() itself raises TTSCanceled
+    # mid-stream (_speak_sentence re-raises after swallowing synthesis) while
+    # the barge_in flag races — the terminator is still unconsumed, so the
+    # pipe MUST be drained before the lock releases.
+    proc2 = FakeWorkerProc()
+    vl._worker_proc = proc2
+    try:
+        with mock.patch.object(vl, "_ensure_worker", lambda: None):
+            def _boom(sentence, is_final=False):
+                raise vl.TTSCanceled()
+            try:
+                vl.llm_reply_streaming("hello", speak=_boom,
+                                       cancelled=lambda: False)
+                raise AssertionError("expected TTSCanceled")
+            except vl.TTSCanceled:
+                pass
+        assert proc2.killed is False
+        assert not proc2.stdout._lines, \
+            "orphaned deltas+terminator must be drained, not left for the " \
+            "next turn"
+        assert vl._worker_proc is proc2
+    finally:
+        vl._worker_proc = saved_proc
+    print("  speak-raised TTSCanceled -> pipe drained to terminator too")
+
+
+def t14_overlapping_utterance_queued_not_dropped():
+    """Bug B: an utterance finalized while a turn holds the guard is QUEUED
+    (latest wins), and runs as a fresh turn once the dead turn releases."""
+    import numpy as np
+
+    s = vl.CallSession(stub=None, call_id="t14")
+    assert s.turn_active.acquire(blocking=False)
+    runs = []
+
+    def fake_run_turn(audio, spec_epoch=None):
+        runs.append((audio, spec_epoch))
+
+    fake_audio = np.zeros(16, dtype="float32")
+    with mock.patch.object(s, "_run_turn", side_effect=fake_run_turn):
+        # Overlapping utterance while the guard is held -> queued, not run.
+        s._process_turn(fake_audio, 7)
+        assert not runs, "queued utterance must not run while guard is held"
+        assert s.pending_turn.qsize() == 1, "utterance must be queued"
+        # A second overlap REPLACES the queued one (latest wins).
+        s._process_turn(np.zeros(8, dtype="float32"), 9)
+        assert s.pending_turn.qsize() == 1
+        s.turn_active.release()
+        # Release path: the kick starts the queued utterance as a fresh turn.
+        s._kick_pending_turn()
+        deadline = time.time() + 2.0
+        while len(runs) < 1 and time.time() < deadline:
+            time.sleep(0.01)
+    assert len(runs) == 1, f"queued utterance must run once, got {runs}"
+    assert runs[0][1] == 9, f"the LATEST queued utterance must run, got {runs}"
+    assert s.pending_turn.qsize() == 0, "kick must consume the queue"
+    print("  overlapping utterance queued (latest wins), kicked after release")
 
 
 def t11_adopt_block_wiring():
@@ -562,6 +761,11 @@ def t11_adopt_block_wiring():
         f"unmute must run exactly on trigger + adopt paths, found {n_unmute}"
     print("  adopt path wiring: proof gate -> unmute -> bh2_selfcheck=True")
 run("11. adopt block wiring (proof, unmute, selfcheck)", t11_adopt_block_wiring)
+run("12. BH2 self-check starts on first emit", t12_selfcheck_starts_on_first_emit)
+run("13. barged-in turn releases guard promptly + drains pipe",
+    t13_bargein_releases_guard_promptly)
+run("14. overlapping utterance queued (not dropped), runs after release",
+    t14_overlapping_utterance_queued_not_dropped)
 
 
 # pytest-compat: module-level checks above run at import; the unittest bridge

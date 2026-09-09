@@ -71,6 +71,16 @@ SPECULATIVE_STT_MS = int(os.environ.get("DFV_SPECULATIVE_STT_MS", "300"))
 # up and transcribing itself. Sized above a normal STT decode so a slower host
 # still collects the work it already started rather than paying for it twice.
 SPECULATIVE_WAIT_MS = int(os.environ.get("DFV_SPECULATIVE_WAIT_MS", "700"))
+# Cancelled-stream drain bound (2026-09-09 barge-in dead air): when a barged-in
+# turn is abandoned mid-stream, the worker pipe must be drained to its
+# terminator before the next prompt (single stdin/stdout pipe, no request ids).
+# The provider keeps generating during the drain, so it is time-bounded: past
+# DFV_DRAIN_TIMEOUT_S the worker is killed and respawned by the next
+# _ensure_worker() — guaranteed clean pipe, bounded hold on _worker_lock.
+DFV_DRAIN_TIMEOUT_S = float(os.environ.get("DFV_DRAIN_TIMEOUT_S", "45"))
+# How long the BH2 self-check tap waits for the FIRST PLAYBACK packet before
+# giving up (fail-open WARNING, never a false 'playback leg dead' ERROR).
+DFV_FIRST_EMIT_WAIT_S = float(os.environ.get("DFV_FIRST_EMIT_WAIT_S", "10"))
 # Outbound trigger: the gateway (or any local client) drops a JSON file here
 # to have the warm voice service place an authorized call. Polled at TRIGGER_POLL_S
 TRIGGER_PATH = os.environ.get(
@@ -366,6 +376,20 @@ class CallSession:
         self.capture_f32_24k = queue.Queue(maxsize=500)
         self.capture_lock = threading.Lock()   # guards VAD ring buffer
         self.turn_active = threading.Semaphore(1)  # single-flight turn guard
+        # Barge-in recovery (2026-09-09 live call 2): a turn whose TTS gets
+        # barged-in used to HOLD turn_active until the whole LLM stream
+        # finished, while every finalized utterance in that window hit the
+        # non-blocking acquire and was silently DROPPED — reply canceled +
+        # both interrupting utterances dropped + 28s of dead air. Now the
+        # latest finalized utterance is QUEUED (at most one) and runs as soon
+        # as the dead turn releases.
+        self.pending_turn: "queue.Queue" = queue.Queue(maxsize=1)
+        # Set by _emit_speech on FIRST emission of a call — anchors the BH2
+        # self-check to the moment audio actually flows (the tap must never
+        # start before the bidi stream has flushed audio; tap-before-audio
+        # read silence on a healthy leg and logged a false 'playback leg
+        # dead' ERROR on live call 2).
+        self.first_emit = threading.Event()
         # Speculative STT bookkeeping. `spec_epoch` invalidates an in-flight
         # speculation the moment the caller starts speaking again.
         self.spec_lock = threading.Lock()
@@ -658,9 +682,55 @@ class CallSession:
         # on _worker_lock, both queued speech into the same playback stream, and
         # whichever finished first cleared the OTHER turn's barge_in flag. The
         # result was overlapping replies and barge-in that stopped working.
+        #
+        # 2026-09-09 (barge-in recovery): a turn whose TTS gets barged-in used
+        # to keep turn_active until the WHOLE LLM stream finished while its
+        # speech was already dead — every finalized utterance in that window
+        # was silently dropped (live call 2: reply canceled, both of Captain's
+        # interrupting utterances dropped, 28s of dead air). Now the latest
+        # finalized utterance is QUEUED (at most one) instead of dropped, and
+        # runs as a fresh turn the moment the dead turn releases.
         if not self.turn_active.acquire(blocking=False):
-            log.info("turn already in flight; dropping overlapping utterance")
+            # Queue the LATEST utterance: replacing a pending entry is the
+            # correct recovery for rapid double-interruption — the older one
+            # is superseded speech, but the caller's LAST words still get a
+            # reply (nothing silently vanishes).
+            try:
+                self.pending_turn.put_nowait((f32_16k, spec_epoch))
+            except queue.Full:
+                try:
+                    self.pending_turn.get_nowait()
+                    log.info("replaced queued overlapping utterance with "
+                             "newer one")
+                except queue.Empty:
+                    pass
+                self.pending_turn.put_nowait((f32_16k, spec_epoch))
+            log.info("turn already in flight; queued overlapping utterance "
+                     "(barge-in recovery)")
             return
+        self._run_turn(f32_16k, spec_epoch)
+
+    def _kick_pending_turn(self) -> None:
+        """Start the queued (latest) utterance as a fresh turn, if any.
+
+        Called from _run_turn's finally AFTER the guard is released, so the
+        kicked turn always finds the semaphore free (a new utterance may win
+        the race instead — then this entry just re-queues and runs later;
+        nothing is ever dropped).
+        """
+        try:
+            pending, pending_spec = self.pending_turn.get_nowait()
+        except queue.Empty:
+            return
+        log.info("running queued overlapping utterance (barge-in recovery)")
+        threading.Thread(
+            target=self._process_turn, args=(pending, pending_spec),
+            daemon=True,
+        ).start()
+
+    def _run_turn(self, f32_16k: np.ndarray,
+                  spec_epoch: int | None = None) -> None:
+        """One held-guard turn: STT -> streaming LLM -> speech."""
         try:
             t0 = time.perf_counter()
             text = None
@@ -684,6 +754,7 @@ class CallSession:
                 spoke["any"] = True
                 self._speak_sentence(sentence, is_final=is_final)
 
+            canceled = False
             try:
                 # Streaming turn: first sentence speaks while the model is
                 # still generating the rest (2026-09-07 latency pass).
@@ -693,6 +764,7 @@ class CallSession:
                     cancelled=lambda: self.barge_in.is_set(),
                 )
             except TTSCanceled:
+                canceled = True
                 log.info("TTS canceled by barge-in")
             except Exception:
                 # Worker died, stream broke, JSON was malformed — the caller is
@@ -706,10 +778,25 @@ class CallSession:
             finally:
                 self.playing.clear()
                 self.barge_in.clear()
+            if canceled:
+                # Barge-in recovery, part 2: the turn is DEAD — speech was
+                # canceled but the LLM stream kept holding the turn. The
+                # stream itself was already canceled + drained inside
+                # llm_reply_streaming (see _drain_cancelled_stream there),
+                # so releasing now hands the guard to the queued utterance
+                # immediately instead of 28s later (live call 2).
+                log.info("barged-in turn released (canceled stream drained)")
         except Exception:
             log.exception("turn failed")
         finally:
             self.turn_active.release()
+            # Barge-in recovery, part 3: a finalized utterance may be waiting
+            # (queue holds the latest one). Start it as a fresh turn — the
+            # guard is already free, so it proceeds immediately.
+            try:
+                self._kick_pending_turn()
+            except Exception:
+                log.exception("pending-turn kick failed")
 
     def _speak_sentence(self, sentence: str, is_final: bool = False) -> None:
         """TTS one sentence and emit it (streaming turn path)."""
@@ -728,6 +815,12 @@ class CallSession:
                 self.rec_writer_agent.writeframes(pcm)
             except Exception:
                 log.debug("agent recording write failed", exc_info=True)
+        # First PLAYBACK packet of the call: unblocks the BH2 self-check tap
+        # (it must sample audio that is actually flowing, not a stream that
+        # has not started — live call 2's false 'playback leg dead').
+        if not self.first_emit.is_set():
+            self.first_emit.set()
+            log.info("first playback packet queued — BH2 self-check armed")
         self.writer.put(("PLAYBACK", pcm))
 
 
@@ -1395,6 +1488,16 @@ def _ensure_outbound_mic_unmuted(session=None) -> str:
 def _run_call(session, was_outbound: bool, stub,
               bh2_selfcheck: bool = False) -> None:
     """Greeting (outbound), audio loop, and end-watcher for one call."""
+    # The audio bidi stream must be attached BEFORE the greeting: the writer
+    # thread is what sends the START packet, and the daemon only answers
+    # 'ready' after it — audio emitted before that point queues in
+    # session.writer and reaches BlackHole 2ch only once the stream is up.
+    # Live call 2 (2026-09-09): the tap sampled 07:18:57-07:19:00, the
+    # 'ready' event landed 07:19:03 — the greeting was playing to a stream
+    # that had not started, which is exactly how a healthy leg reads 0.0000.
+    t_audio = threading.Thread(target=session.audio_loop, daemon=True)
+    t_audio.start()
+
     # Outbound calls connect with the callee hearing dead air (the loop
     # is otherwise mute until they speak first). Speak immediately so
     # Captain knows the line is live — three 2026-09-06 flights ended
@@ -1407,10 +1510,25 @@ def _run_call(session, was_outbound: bool, stub,
         # after it finished would read silence even on a healthy, now-idle
         # leg); if it stays silent, log the ground truth and speak an
         # audible warning. Fail-open, once per call, adopt path only.
+        #
+        # 2026-09-09 (live call 2, false 'playback leg dead'): the tap used
+        # to start at greeting begin — BEFORE the stream had flushed any
+        # audio (emit goes through the daemon bidi stream whose first
+        # packet is only sent when audio_loop's generator first runs; the
+        # 'ready' event landed 6s after connect, AFTER the tap window
+        # closed). The tap now arms only after the FIRST PLAYBACK packet is
+        # queued (session.first_emit, set by _emit_speech), so it always
+        # samples a leg that is actually carrying audio.
         tap = {"peak": None}
         tap_th = None
         if bh2_selfcheck:
             def _tap_bh2():
+                # Wait (bounded) for first emission, then sample 3s of BH2
+                # while the greeting is still playing. Fail-open on timeout:
+                # a missing reading logs a WARNING, never a false ERROR.
+                if not session.first_emit.wait(timeout=DFV_FIRST_EMIT_WAIT_S):
+                    tap["no_emit"] = True
+                    return
                 try:
                     tap["peak"] = _bh2_tap_peak(3.0)[0]
                 except Exception:
@@ -1434,9 +1552,11 @@ def _run_call(session, was_outbound: bool, stub,
             session.playing.clear()
             session.barge_in.clear()
         if tap_th is not None:
-            tap_th.join(timeout=5.0)
+            tap_th.join(timeout=15.0)
             if tap_th.is_alive():
                 log.warning("BH2 tap thread did not finish — self-check skipped")
+            elif tap.get("no_emit"):
+                log.warning("BH2 self-check skipped: no audio emitted yet")
             elif barged or not greeted:
                 log.info("BH2 self-check skipped (greeting barged-in or "
                          "failed; tap peak=%s)", tap["peak"])
@@ -1466,9 +1586,9 @@ def _run_call(session, was_outbound: bool, stub,
                 log.info("BH2 playback self-check passed (peak=%.4f)",
                          tap["peak"])
 
-    # run until the call ends
-    t = threading.Thread(target=session.audio_loop, daemon=True)
-    t.start()
+    # run until the call ends (audio thread started above, before the
+    # greeting — see the comment at the top of this function)
+    t = t_audio
 
     # The daemon emits no 'ended' event on its WaitIncoming stream; the
     # in-call Phone surface vanishing IS the end signal. Poll Control
@@ -1557,6 +1677,68 @@ def persist_call_memory(dialogue: list[dict], call_id: str) -> str | None:
         return None
 
 
+def _drain_cancelled_stream() -> None:
+    """Read the worker pipe to the cancelled turn's terminator and discard.
+
+    MUST run while _worker_lock is HELD (caller: llm_reply_streaming) and only
+    when the turn's terminator line was NOT consumed (call it with
+    needs_drain=True only from the TTSCanceled handler; the terminator branch
+    already consumed the line, so draining there would block on an idle pipe).
+
+    The worker is a single stdin/stdout JSON-lines pipe with NO request ids —
+    abandoning a mid-stream turn without draining would let its orphaned
+    {"delta"}/{"content"} lines be misread as the NEXT turn's response
+    (cross-turn poisoning). Draining to the {"content"|"error"} terminator
+    guarantees the next prompt starts on a clean line boundary.
+
+    The provider keeps generating during the drain, so it is time-bounded
+    (DFV_DRAIN_TIMEOUT_S, default 45s): on timeout the worker is killed and
+    the next _ensure_worker() respawns it — a guaranteed-clean pipe and a
+    bounded hold on _worker_lock, at the cost of the worker's in-process
+    warm state (same cost as the historical 'worker died mid-turn' path).
+    """
+    global _worker_proc
+    deadline = time.monotonic() + DFV_DRAIN_TIMEOUT_S
+    try:
+        while True:
+            if time.monotonic() >= deadline:
+                drain_s = time.monotonic() - (deadline - DFV_DRAIN_TIMEOUT_S)
+                log.warning(
+                    "cancelled-stream drain timed out after %.1fs — killing "
+                    "worker to guarantee a clean pipe (respawned on next turn)",
+                    drain_s)
+                try:
+                    _worker_proc.kill()
+                except Exception:
+                    pass
+                _worker_proc = None
+                return
+            line = _worker_proc.stdout.readline()
+            if not line:
+                log.warning("worker died while draining cancelled stream")
+                _worker_proc = None
+                return
+            msg = json.loads(line)
+            if "content" in msg or "error" in msg:
+                drain_s = time.monotonic() - (deadline - DFV_DRAIN_TIMEOUT_S)
+                log.info("cancelled stream drained to terminator in %.2fs",
+                         drain_s)
+                if drain_s > 20.0:
+                    log.warning("drain took %.1fs (provider kept generating "
+                                "the barged-in turn)", drain_s)
+                return
+            # delta/filler/anything else: discarded.
+    except Exception:
+        # A drain failure means the pipe state is untrusted — kill the worker
+        # so the next turn respawns a fresh one instead of reading poison.
+        log.exception("cancelled-stream drain failed — killing worker")
+        try:
+            _worker_proc.kill()
+        except Exception:
+            pass
+        _worker_proc = None
+
+
 def llm_reply_streaming(user_text: str, speak, cancelled) -> str:
     """Streaming turn: speak sentences as the model generates them.
 
@@ -1564,6 +1746,12 @@ def llm_reply_streaming(user_text: str, speak, cancelled) -> str:
     drops from full-turn to first-sentence (~1-2.5s projected). Falls back to
     llm_reply + batch TTS if the worker returns no deltas (tool turns, older
     worker). Returns the full reply text for the dialogue transcript.
+
+    2026-09-09 (barge-in dead air): `cancelled` is now HONORED. A barged-in
+    turn raises TTSCanceled as soon as the current speak() unblocks, and the
+    worker pipe is drained to the turn's terminator before releasing
+    _worker_lock (single stdin/stdout pipe, no request ids — orphaned deltas
+    must never leak into the next turn).
     """
     with _dialogue_lock:
         _dialogue.append({"role": "user", "content": user_text})
@@ -1578,73 +1766,151 @@ def llm_reply_streaming(user_text: str, speak, cancelled) -> str:
     spoke_reply = False
     spoke_anything = False
     tier = "fast"
+    canceled = False
+    global _worker_proc
+    # PIPE-CLEANLINESS INVARIANT: _worker_lock may only release after the
+    # turn's {"content"|"error"} terminator line has been consumed (or the
+    # pipe is known-dead/respawned). The worker is a single stdin/stdout
+    # JSON-lines pipe with NO request ids — an unconsumed terminator means
+    # the next turn reads THIS turn's orphaned deltas (cross-turn poison).
+    # So `needs_drain` flips True the moment we hold a line that is NOT the
+    # terminator, and the finally block drains it off. Paths:
+    #   - barge-in on a delta line -> drain to terminator
+    #   - speak() raising TTSCanceled mid-stream (the exact call-2 signature:
+    #     'TTS canceled by barge-in' from _speak_sentence) -> drain
+    #   - malformed JSON / unexpected line -> drain (terminator may follow)
+    #   - worker died (readline '') / RuntimeError / lock-write failure ->
+    #     no drain; _worker_proc=None forces the next turn to respawn clean
+    #   - terminator consumed -> pipe already clean, nothing to do
+    needs_drain = False
     with _worker_lock:
         _ensure_worker()
-        _worker_proc.stdin.write(json.dumps({
-            "prompt": user_text, "stream": True,
-        }) + "\n")
-        _worker_proc.stdin.flush()
-        while True:
-            line = _worker_proc.stdout.readline()
-            if not line:
-                raise RuntimeError("worker died mid-stream")
-            msg = json.loads(line)
-            if "filler" in msg:
-                # The worker routed this turn to the tool-enabled agent, which
-                # streams nothing until its whole loop finishes. Speak now so
-                # the caller hears acknowledgement instead of dead air.
-                filler = (msg.get("filler") or "").strip()
-                if filler:
-                    tier = "full"
-                    spoke_anything = True
-                    speak(filler, is_final=False)
-                continue
-            if "delta" in msg:
-                buf += msg["delta"]
-                # Only the turn's first chunk may break early at a clause.
-                sentences, buf = _pop_sentences(buf, allow_clause=not spoke_reply)
-                for s in sentences:
-                    collected.append(s)
-                    if s.strip():
+        try:
+            _worker_proc.stdin.write(json.dumps({
+                "prompt": user_text, "stream": True,
+            }) + "\n")
+            _worker_proc.stdin.flush()
+        except Exception:
+            # Broken pipe on write: the worker is dying — respawn next turn.
+            log.exception("worker write failed — respawning worker")
+            try:
+                _worker_proc.kill()
+            except Exception:
+                pass
+            _worker_proc = None
+            raise
+        try:
+            while True:
+                line = _worker_proc.stdout.readline()
+                if not line:
+                    raise RuntimeError("worker died mid-stream")
+                msg = json.loads(line)
+                if "filler" in msg:
+                    # The worker routed this turn to the tool-enabled agent,
+                    # which streams nothing until its whole loop finishes.
+                    # Speak now so the caller hears acknowledgement instead
+                    # of dead air.
+                    filler = (msg.get("filler") or "").strip()
+                    needs_drain = True
+                    if filler:
+                        tier = "full"
+                        spoke_anything = True
+                        speak(filler, is_final=False)
+                    continue
+                if "delta" in msg:
+                    if cancelled():
+                        # Barge-in: the SPEECH is dead — abandon the turn
+                        # NOW instead of speaking to nobody while the model
+                        # generates for another ~28s (live call 2). The
+                        # terminator has NOT been consumed: drain first.
+                        canceled = True
+                        raise TTSCanceled()
+                    needs_drain = True
+                    buf += msg["delta"]
+                    # Only the turn's first chunk may break early at a clause.
+                    sentences, buf = _pop_sentences(buf, allow_clause=not spoke_reply)
+                    for s in sentences:
+                        collected.append(s)
+                        if s.strip():
+                            spoke_reply = True
+                            spoke_anything = True
+                            speak(s.strip(), is_final=False)
+                elif "content" in msg or "error" in msg:
+                    # The terminator is consumed: the pipe is clean no matter
+                    # what speaking does from here on.
+                    needs_drain = False
+                    if msg.get("error"):
+                        log.warning("worker stream error: %s", msg["error"])
+                    tier = msg.get("tier", tier)
+                    final = (msg.get("content") or "").strip()
+                    # Any completed sentences never streamed as deltas (tool
+                    # turns emit only the final content) — speak the whole
+                    # thing now.
+                    if not spoke_reply and final:
+                        speak(final, is_final=True)
                         spoke_reply = True
                         spoke_anything = True
-                        speak(s.strip(), is_final=False)
-            elif "content" in msg or "error" in msg:
-                if msg.get("error"):
-                    log.warning("worker stream error: %s", msg["error"])
-                tier = msg.get("tier", tier)
-                final = (msg.get("content") or "").strip()
-                # Any completed sentences never streamed as deltas (tool turns
-                # emit only the final content) — speak the whole thing now.
-                if not spoke_reply and final:
-                    speak(final, is_final=True)
-                    spoke_reply = True
-                    spoke_anything = True
-                if final and not collected:
-                    collected.append(final)
-                tail = buf.strip()
-                if tail:
-                    collected.append(tail)
-                    speak(tail, is_final=True)
-                    spoke_anything = True
-                # NEVER GO SILENT. 2026-09-07: on a worker error `final` is ""
-                # and every branch above was skipped, so nothing was spoken —
-                # but the transcript still recorded the "came back empty" line
-                # below, which made the logs look like a completed turn while
-                # the Captain heard pure dead air. That is the "sometimes he
-                # just never says anything" failure. An audible failure is
-                # always better than silence on a live call.
-                if not spoke_anything:
-                    log.error("turn produced no speakable text (error=%s) — "
-                              "speaking audible fallback", msg.get("error"))
-                    try:
-                        speak(TURN_FAILED_LINE, is_final=True)
-                    except TTSCanceled:
-                        raise
-                    except Exception:
-                        log.exception("even the fallback line failed to speak")
-                break
+                    if final and not collected:
+                        collected.append(final)
+                    tail = buf.strip()
+                    if tail:
+                        collected.append(tail)
+                        speak(tail, is_final=True)
+                        spoke_anything = True
+                    # NEVER GO SILENT. 2026-09-07: on a worker error `final`
+                    # is "" and every branch above was skipped, so nothing was
+                    # spoken — but the transcript still recorded the "came
+                    # back empty" line below, which made the logs look like a
+                    # completed turn while the Captain heard pure dead air.
+                    # That is the "sometimes he just never says anything"
+                    # failure. An audible failure is always better than
+                    # silence on a live call.
+                    if not spoke_anything:
+                        log.error("turn produced no speakable text (error=%s) — "
+                                  "speaking audible fallback", msg.get("error"))
+                        try:
+                            speak(TURN_FAILED_LINE, is_final=True)
+                        except Exception:
+                            log.exception("even the fallback line failed to speak")
+                    break
+        except TTSCanceled:
+            canceled = True
+        except json.JSONDecodeError:
+            # Malformed line mid-stream: the pipe content is untrusted. Kill
+            # the worker and surface as RuntimeError so _run_turn speaks the
+            # audible fallback (never-go-silent), not a silent cancel.
+            log.exception("malformed worker line — killing worker for a "
+                          "clean pipe")
+            needs_drain = False
+            try:
+                _worker_proc.kill()
+            except Exception:
+                pass
+            _worker_proc = None
+            raise RuntimeError("malformed worker line") from None
+        except Exception:
+            # RuntimeError('worker died mid-stream') or any other stream
+            # failure: readline returned '' — nothing left to drain. Mark the
+            # worker dead so the next turn respawns a clean pipe.
+            log.exception("worker stream failed — respawning worker next turn")
+            needs_drain = False
+            _worker_proc = None
+            raise
+        finally:
+            if needs_drain:
+                # Terminator not consumed -> read-and-discard to it (time-
+                # bounded; kill+respawn on timeout). Guarantees the next
+                # turn starts on a clean line boundary.
+                _drain_cancelled_stream()
     elapsed = time.perf_counter() - t0
+    if canceled:
+        with _dialogue_lock:
+            _dialogue.append({
+                "role": "assistant",
+                "content": "[turn canceled by barge-in]",
+            })
+        log.info("streaming turn canceled by barge-in after %.2fs", elapsed)
+        raise TTSCanceled()
     text = " ".join(collected).strip() or "I'm here, Captain, but my response came back empty."
     with _dialogue_lock:
         _dialogue.append({"role": "assistant", "content": text})
