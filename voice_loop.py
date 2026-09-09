@@ -871,11 +871,19 @@ def _nc_process_name(name: str) -> bool:
 
 
 def _ax2_path() -> str:
-    """Path to the bridge's AX helper binary (ax2, falling back to ax)."""
-    ax2 = os.path.expanduser("~/.local/bin/facetime-bridge-ax2")
-    if not os.path.exists(ax2):
-        ax2 = os.path.expanduser("~/.local/bin/facetime-bridge-ax")
-    return ax2
+    """Path to the bridge's AX helper binary for CLI probes/presses.
+
+    ax3 carries the --ax-press / --frames additions. ax2's PATH is
+    provenance-bound (09-08: a different binary at that exact path passes
+    --self-check but gets taskgate-killed on any AX-touching call), so the
+    NEW code lives at ax3 — while the launchd DAEMON keeps running from ax2
+    (its plist is untouched and it never uses the new subcommands).
+    """
+    for name in ("facetime-bridge-ax3", "facetime-bridge-ax2"):
+        p = os.path.expanduser(f"~/.local/bin/{name}")
+        if os.path.exists(p):
+            return p
+    return os.path.expanduser("~/.local/bin/facetime-bridge-ax")
 
 
 def _ax2_snapshot_frames() -> list:
