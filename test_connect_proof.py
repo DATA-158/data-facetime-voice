@@ -274,14 +274,16 @@ def t4b_unmute_unmuted():
 run("4b. unmute: unmuted -> no press", t4b_unmute_unmuted)
 
 
-def t4c_unmute_unknown_menu_fallback():
-    """unknown -> menu fallback attempted -> 'unknown (none)' — never raises."""
+def t4c_unmute_unknown_no_toggle():
+    """unknown -> NO toggle of any kind (call-3 fix): state stays unknown,
+    zero osascript calls, never raises. A blind toggle muted call 3's live
+    mic; unclassifiable state must mean DO NOTHING."""
     osa = []
 
     def fake_run(argv, **kwargs):
         if argv and argv[0] == "osascript":
             osa.append(list(argv))
-            return run_result(stdout="missing value", returncode=0)
+            return run_result(stdout="missing value")
         if "--ax-snapshot" in argv:
             return run_result(stdout=json.dumps(NOMUTE_FRAMES))
         raise AssertionError(f"unexpected subprocess call: {argv}")
@@ -290,15 +292,76 @@ def t4c_unmute_unknown_menu_fallback():
          mock.patch("subprocess.run", side_effect=fake_run):
         state = vl._ensure_outbound_mic_unmuted()  # must not raise
     assert state == "unknown", state
-    assert osa, "menu fallback not attempted"
-    scripts = [c[2] for c in osa]  # argv = ['osascript', '-e', <script>]
-    assert any("AXMenuItemMarkChar" in s for s in scripts), \
-        "mark-char read (BEFORE/AFTER) not attempted"
-    assert any("click menu item" in s for s in scripts), "menu click not attempted"
-    assert len(osa) == 3, f"expected BEFORE+click+AFTER (3 calls), got {len(osa)}"
-    print(f"  unknown -> menu fallback ran ({len(osa)} osascript calls), "
-          "state stays unknown, no exception")
-run("4c. unmute: unknown -> menu fallback, never raises", t4c_unmute_unknown_menu_fallback)
+    assert not osa, \
+        f"BLIND menu toggle ran on unknown state: {osa}"
+    print("  unknown -> no blind toggle (0 osascript calls), state unknown")
+run("4c. unmute: unknown -> NO toggle (call-3 fix)", t4c_unmute_unknown_no_toggle)
+
+
+def t4d_unmute_muted_press_unconfirmed_menu_gated():
+    """muted -> ax2 press not confirmed -> menu path GATED on Video>Mute
+    enabled=true (live call) -> toggle runs -> post-toggle banner verify."""
+    snaps = {"n": 0}
+    osa = []
+
+    def fake_run(argv, **kwargs):
+        if "--ax-press" in argv:
+            return run_result(stdout=json.dumps({"pressed": False,
+                                                 "reason": "no match"}))
+        if "--ax-snapshot" in argv:
+            snaps["n"] += 1
+            return run_result(stdout=json.dumps(MUTED_FRAMES if snaps["n"] == 1
+                                                else UNMUTED_FRAMES))
+        if argv and argv[0] == "osascript":
+            osa.append(list(argv))
+            if "enabled of menu item" in argv[2]:
+                return run_result(stdout="true")   # live call: Mute enabled
+            return run_result(stdout="missing value")  # mark char, as live
+        raise AssertionError(f"unexpected subprocess call: {argv}")
+
+    with mock.patch("os.path.exists", return_value=True), \
+         mock.patch("subprocess.run", side_effect=fake_run):
+        state = vl._ensure_outbound_mic_unmuted()
+    assert state == "unmuted", state
+    clicks = [c for c in osa if "click menu item" in c[2]]
+    enabled_q = [c for c in osa if "enabled of menu item" in c[2]]
+    assert len(enabled_q) == 1, "Mute enabled probe not read before toggling"
+    assert len(clicks) == 1, f"expected the gated menu click, got {osa}"
+    assert enabled_q[0] == osa[0], "enabled probe must precede the click"
+    assert snaps["n"] == 2, "post-toggle banner re-verify never ran"
+    print("  muted + press unconfirmed -> enabled=true -> menu toggle -> "
+          "banner re-verified unmuted")
+run("4d. muted: gated menu toggle only when Video>Mute is enabled",
+    t4d_unmute_muted_press_unconfirmed_menu_gated)
+
+
+def t4e_unmute_menu_disabled_never_clicks():
+    """Mute menu DISABLED (no active call) -> click refused: only the enabled
+    probe runs, state stays 'muted' (honest 'no'), no toggle, never raises."""
+    osa = []
+
+    def fake_run(argv, **kwargs):
+        if "--ax-press" in argv:
+            return run_result(stdout=json.dumps({"pressed": False}))
+        if "--ax-snapshot" in argv:
+            return run_result(stdout=json.dumps(MUTED_FRAMES))
+        if argv and argv[0] == "osascript":
+            osa.append(list(argv))
+            if "enabled of menu item" in argv[2]:
+                return run_result(stdout="false")  # no call active
+            return run_result(stdout="missing value")
+        raise AssertionError(f"unexpected subprocess call: {argv}")
+
+    with mock.patch("os.path.exists", return_value=True), \
+         mock.patch("subprocess.run", side_effect=fake_run):
+        state = vl._ensure_outbound_mic_unmuted()  # must not raise
+    assert state == "muted", state
+    clicks = [c for c in osa if "click menu item" in c[2]]
+    assert not clicks, f"clicked Mute while DISABLED (would arm mute): {osa}"
+    assert len(osa) == 1 and "enabled of menu item" in osa[0][2], osa
+    print("  Mute disabled (no call) -> toggle refused, state stays muted")
+run("4e. disabled Mute menu -> never clicks (pre-call arm guard)",
+    t4e_unmute_menu_disabled_never_clicks)
 
 
 def t5_never_raises():

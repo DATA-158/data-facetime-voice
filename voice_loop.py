@@ -1402,13 +1402,28 @@ def _ensure_outbound_mic_unmuted(session=None) -> str:
     connect is confirmed, and NEVER raises: a failure here must degrade to a
     log line, not kill the call path.
 
-    Order: ax2 snapshot to classify the banner mic control → if it reads
-    muted, ax2 press + re-snapshot to verify → System Events Video>Mute
-    menu toggle as the fallback (SE CAN read app menus, unlike NC banners;
-    AXMenuItemMarkChar reads 'missing value' before AND after on this build
-    — logged as inconclusive).
+    Call-3 fix (2026-09-09): the old fallback issued a BLIND
+    Video>Mute click whenever the banner classified 'unknown'. On this
+    macOS 26 build AXMenuItemMarkChar reads 'missing value' before AND after
+    a toggle (menu mark is unreadable), so nothing verified the click — and
+    call 3 landed that coin flip on MUTING a live, working mic (Captain
+    heard nothing). New law: a blind toggle can silence a working mic; an
+    unmuted-but-unverified mic is the lesser failure.
 
-    Returns the final state: 'unmuted' | 'unknown'.
+    Order: ax2 snapshot to classify the banner mic control →
+      * state 'muted' (positively classified): ax2 press + re-snapshot
+        verify; if the press does not confirm, the System Events
+        Video>Mute menu path runs — but ONLY after reading the Mute item's
+        `enabled` attribute: it is DISABLED when no call is active, so a
+        disabled read means we refuse to toggle (a pre-call Mute click
+        arms the mute for the call about to start — the call-3 silence).
+      * state 'unknown': DO NOTHING — log the skip, return 'unknown'.
+        No blind toggle, ever.
+    The banner press path keeps its pressed-confirmation: an ax2 press that
+    reports pressed=false no longer claims success on a re-snapshot that
+    fails to classify.
+
+    Returns the final state: 'unmuted' | 'muted' | 'unknown'.
     """
     method = "none"
     state = "unknown"
@@ -1422,6 +1437,8 @@ def _ensure_outbound_mic_unmuted(session=None) -> str:
         if state == "muted":
             import subprocess as _sp
             log.info("banner shows mic MUTED — pressing the mute control")
+            method = "ax2-press"
+            pressed = False
             try:
                 r = _sp.run(
                     [_ax2_path(), "--ax-press", "--process",
@@ -1430,7 +1447,10 @@ def _ensure_outbound_mic_unmuted(session=None) -> str:
                 )
                 out = json.loads((r.stdout or "{}"))
                 log.info("ax2 mute press: %r", out)
-                method = "ax2-press"
+                pressed = bool(out.get("pressed"))
+            except Exception as e:
+                log.warning("ax2 mute press failed: %s", e)
+            if pressed:
                 # (b) RE-SNAPSHOT to verify the muted indication is gone.
                 after = _banner_mute_state(_ax2_snapshot_frames())
                 log.info("post-press banner mute state: %s", after)
@@ -1439,18 +1459,46 @@ def _ensure_outbound_mic_unmuted(session=None) -> str:
                 elif after == "muted":
                     log.warning("banner still reads muted after press")
                 else:
-                    # Pressed but the banner no longer classifies — treat
+                    # Press confirmed + control stopped classifying — treat
                     # the press as taken effect rather than press again.
                     state = "unmuted"
-            except Exception as e:
-                log.warning("ax2 mute press failed: %s", e)
+            else:
+                log.warning("ax2 press not confirmed — trying the gated "
+                            "Video>Mute menu path")
 
         if state != "unmuted":
-            # (c) Fallback: FaceTime's own Video > Mute menu via System
-            # Events. SE cannot see NC banners but CAN read app menus.
-            method = "menu-toggle"
+            # (c) FaceTime's own Video > Mute menu via System Events — GATED,
+            # never blind. SE cannot see NC banners but CAN read app menus.
+            if state == "unknown":
+                # Call-3 root cause removed: an unclassifiable banner is NOT
+                # permission to click. Clicking could mute a live working
+                # mic (coin flip that silenced call 3).
+                log.warning("outbound mic unmute skipped: state unknown "
+                            "(no blind toggle)")
+                return "unknown"
+            import subprocess as _sp
+            enabled_q = (
+                'tell application "System Events" to tell process '
+                '"FaceTime" to get enabled of menu item "Mute" of menu 1 of '
+                'menu bar item "Video" of menu bar 1'
+            )
+            menu_enabled = False
             try:
-                import subprocess as _sp
+                re_ = _sp.run(["osascript", "-e", enabled_q],
+                              capture_output=True, text=True, timeout=10)
+                menu_enabled = (re_.stdout or "").strip().lower() == "true"
+            except Exception as e:
+                log.warning("Video>Mute enabled probe failed (%s) — "
+                            "refusing to toggle blind", e)
+            log.info("Video>Mute menu item enabled=%s (disabled == no call "
+                     "active on this build)", menu_enabled)
+            if not menu_enabled:
+                # No live call (or unreadable): clicking Mute now would ARM
+                # the mute for the call about to start — the call-3 failure.
+                log.warning("Video>Mute is DISABLED — no live call; refusing "
+                            "to toggle (would arm mute pre-call)")
+            else:
+                method = "menu-toggle"
                 before = (
                     'tell application "System Events" to tell process '
                     '"FaceTime" to get value of attribute "AXMenuItemMarkChar" '
@@ -1462,22 +1510,35 @@ def _ensure_outbound_mic_unmuted(session=None) -> str:
                     '"FaceTime" to click menu item "Mute" of menu 1 of menu '
                     'bar item "Video" of menu bar 1'
                 )
-                r0 = _sp.run(["osascript", "-e", before],
-                             capture_output=True, text=True, timeout=10)
-                log.info("menu AXMenuItemMarkChar BEFORE: %r", (r0.stdout or "").strip())
-                _sp.run(["osascript", "-e", click],
-                        capture_output=True, text=True, timeout=10)
-                r1 = _sp.run(["osascript", "-e", before],
-                             capture_output=True, text=True, timeout=10)
-                log.info("menu AXMenuItemMarkChar AFTER: %r", (r1.stdout or "").strip())
-            except Exception as e:
-                log.warning("menu-toggle unmute failed: %s", e)
+                try:
+                    r0 = _sp.run(["osascript", "-e", before],
+                                 capture_output=True, text=True, timeout=10)
+                    log.info("menu AXMenuItemMarkChar BEFORE: %r",
+                             (r0.stdout or "").strip())
+                    _sp.run(["osascript", "-e", click],
+                            capture_output=True, text=True, timeout=10)
+                    r1 = _sp.run(["osascript", "-e", before],
+                                 capture_output=True, text=True, timeout=10)
+                    log.info("menu AXMenuItemMarkChar AFTER: %r",
+                             (r1.stdout or "").strip())
+                    # Post-toggle re-verify on the banner: the mark char is
+                    # unreadable on this build, so the banner is the only
+                    # honest check left.
+                    after = _banner_mute_state(_ax2_snapshot_frames())
+                    log.info("post-menu-toggle banner mute state: %s", after)
+                    if after == "unmuted":
+                        state = "unmuted"
+                    elif after == "muted":
+                        log.warning("banner still reads muted after menu "
+                                    "toggle")
+                except Exception as e:
+                    log.warning("menu-toggle unmute failed: %s", e)
     except Exception as e:
         # NEVER raise: a probe failure must not kill the call path.
         log.warning("mic-unmute check could not run: %s", e)
     finally:
         # (d) Exactly one summary line, always. 'no' = we KNOW the mic is
-        # still muted; 'unknown' = state never classified.
+        # still muted; 'unknown' = state never classified (no toggle ran).
         verdict = ("yes" if state == "unmuted"
                    else "no" if state == "muted" else "unknown")
         fn = log.info if state == "unmuted" else log.warning
