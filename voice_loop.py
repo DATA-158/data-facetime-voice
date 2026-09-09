@@ -863,6 +863,13 @@ def _ax2_env() -> dict:
             "FACETIME_BRIDGE_AUTHORIZED_CALLER_E164": AUTHORIZED_E164 or ""}
 
 
+def _nc_process_name(name: str) -> bool:
+    """NC surface-name matcher: 'NotificationCenter' (executable name, what
+    ax2 actually reports — verified live 09-08) and 'Notification Center'
+    (display spelling) both name the same tray."""
+    return (name or "").replace(" ", "").lower() == "notificationcenter"
+
+
 def _ax2_path() -> str:
     """Path to the bridge's AX helper binary (ax2, falling back to ax)."""
     ax2 = os.path.expanduser("~/.local/bin/facetime-bridge-ax2")
@@ -900,7 +907,7 @@ def _newest_call_node(surfaces) -> "dict | None":
     for s in (surfaces or []):
         if not s.get("enabled", True):
             continue
-        if (s.get("process") or "") != "Notification Center":
+        if not _nc_process_name(s.get("process") or ""):
             continue
         hay = " ".join([str(t) for t in (s.get("texts") or [])]
                        + [str(s.get("label") or "")]).lower()
@@ -1204,7 +1211,7 @@ def _banner_mute_state(surfaces) -> str:
     """
     found = False
     for s in (surfaces or []):
-        if (s.get("process") or "") != "Notification Center":
+        if not _nc_process_name(s.get("process") or ""):
             continue
         texts = [str(t) for t in (s.get("texts") or [])]
         label = str(s.get("label") or "")
