@@ -857,6 +857,127 @@ def _await_outbound_connect(stub, timeout_s: float = 180.0) -> "object | None":
     return None
 
 
+def _ax2_env() -> dict:
+    """Env for ax2 calls: the authorized-caller contract must ride along."""
+    return {**os.environ,
+            "FACETIME_BRIDGE_AUTHORIZED_CALLER_E164": AUTHORIZED_E164 or ""}
+
+
+def _ax2_path() -> str:
+    """Path to the bridge's AX helper binary (ax2, falling back to ax)."""
+    ax2 = os.path.expanduser("~/.local/bin/facetime-bridge-ax2")
+    if not os.path.exists(ax2):
+        ax2 = os.path.expanduser("~/.local/bin/facetime-bridge-ax")
+    return ax2
+
+
+def _ax2_snapshot_frames() -> list:
+    """`ax2 --ax-snapshot --frames`: full (unfiltered) AX dump with frames.
+
+    Unlike the default snapshot (keyword-filtered, no frames — the shape
+    `_call_timer_running` depends on), this returns every surface with
+    per-node frame {x,y,w,h} in points. Raises on any failure; callers
+    decide how to degrade.
+    """
+    import subprocess as _sp
+    r = _sp.run(
+        [_ax2_path(), "--ax-snapshot", "--frames"],
+        capture_output=True, text=True, timeout=20, env=_ax2_env(),
+    )
+    return json.loads(r.stdout or "[]")
+
+
+def _newest_call_node(surfaces) -> "dict | None":
+    """Newest enabled pressable 'Call' node carrying a frame, else None.
+
+    A failed press leaves a STALE banner behind and the fresh prompt arrives
+    after it, so the newest match is the only safe target (2026-09-06
+    lesson). The array is walked in dump order and the LAST match wins —
+    mirroring both the old AppleScript heuristic (item n of hitList) and
+    ax2's own --ax-press newest preference.
+    """
+    matches = []
+    for s in (surfaces or []):
+        if not s.get("enabled", True):
+            continue
+        if (s.get("process") or "") != "Notification Center":
+            continue
+        hay = " ".join([str(t) for t in (s.get("texts") or [])]
+                       + [str(s.get("label") or "")]).lower()
+        if "call" not in hay:
+            continue
+        if "AXPress" not in (s.get("actions") or []) and s.get("role") != "AXButton":
+            continue
+        if not s.get("frame"):
+            continue
+        matches.append(s)
+    if not matches:
+        return None
+    if len(matches) > 1:
+        log.info("%d 'Call' nodes visible — targeting the NEWEST (last) one",
+                 len(matches))
+    return matches[-1]
+
+
+def _in_call_banner_visible() -> bool:
+    """True when a pressable in-call banner control (mute/hang up/end) exists.
+
+    Independent connect proof for the outbound path (issue #6 fix 2): the
+    timer text can be unreadable while a live call IS running. Uses the
+    DEFAULT keyword-filtered snapshot (same channel and shape
+    `_call_timer_running` depends on).
+    """
+    import subprocess as _sp
+    try:
+        r = _sp.run(
+            [_ax2_path(), "--ax-snapshot"],
+            capture_output=True, text=True, timeout=8, env=_ax2_env(),
+        )
+        surfaces = json.loads(r.stdout or "[]")
+    except Exception as e:
+        log.warning("in-call banner probe failed (%s): %s", type(e).__name__, e)
+        return False
+    for s in surfaces:
+        if not s.get("enabled", True):
+            continue
+        if "AXPress" not in (s.get("actions") or []):
+            continue
+        hay = " ".join([str(t) for t in (s.get("texts") or [])]
+                       + [str(s.get("label") or ""),
+                          str(s.get("identifier") or "")]).lower()
+        # Only the in-call banner offers Mute / Hang Up / End; a dial or
+        # prompt surface never does.
+        if any(w in hay for w in ("mute", "hang up", "end call")) or "end" in hay.split():
+            return True
+    return False
+
+
+def _click_to_call_prompt_visible() -> bool:
+    """True while a 'Click to Call' banner is still unanswered in NC.
+
+    Guards the stale-surface grace in _place_call_direct: a visible prompt
+    means the call was NEVER confirmed. Probe failure fails SAFE (True) —
+    an unreadable screen must never enable the heuristic connect.
+    """
+    import subprocess as _sp
+    try:
+        r = _sp.run(
+            [_ax2_path(), "--ax-snapshot"],
+            capture_output=True, text=True, timeout=8, env=_ax2_env(),
+        )
+        surfaces = json.loads(r.stdout or "[]")
+    except Exception as e:
+        log.warning("Click-to-Call prompt probe failed (%s): %s",
+                    type(e).__name__, e)
+        return True
+    for s in surfaces:
+        hay = " ".join([str(t) for t in (s.get("texts") or [])]
+                       + [str(s.get("label") or "")]).lower()
+        if "click to call" in hay:
+            return True
+    return False
+
+
 def _place_call_direct(stub) -> "object | None":
     """Place the outbound call via the FaceTime Audio URL and wait for connect.
 
@@ -886,21 +1007,22 @@ def _place_call_direct(stub) -> "object | None":
         log.error("URL open failed: %s", e)
         return None
 
-    # 2026-09-07 latency pass. The old loop called BOTH expensive AX probes once
-    # per second for up to 90s:
-    #   - _press_click_to_call_if_present() runs an AppleScript that walks
-    #     `entire contents of` every Notification Center UI element. That is one
-    #     of the slowest calls in the AX API and it ran every iteration until it
-    #     succeeded, so the "1s poll" was really seconds per turn of the loop and
-    #     it hammered the AX subsystem while the call was trying to come up.
-    #   - _call_timer_running() spawns the AX snapshot binary each time.
-    # Now: pgrep is the fast poll (4ms), the Click-to-Call press is attempted a
-    # bounded number of times inside the window where the prompt actually
-    # appears, and the timer probe only runs once the Phone surface exists.
+    # 2026-09-08 (issue #6): the 12s blind connect is GONE. On tonight's
+    # live call the Phone surface was up but the prompt was never pressed
+    # (System Events cannot see NC banner buttons on macOS 26), and the old
+    # fallback returned 'connected' 12s in anyway — the false connect that
+    # left the callee ringing while we played a greeting to nobody.
+    # Connect now requires PROOF, in this order:
+    #   1. running call timer in the AX snapshot (unchanged)
+    #   2. pressable in-call banner controls (mute/hang up/end) — the timer
+    #      text is not always readable, but a live call always shows them
+    #   3. after 45s of Phone-up with the prompt-press budget spent and NO
+    #      Click-to-Call prompt visible: the honest stale-surface heuristic
+    #      (logged as unproven). A visible prompt NEVER fakes a connect.
     CLICK_TO_CALL_WINDOW_S = 20.0   # prompt appears within ~10s if at all
     CLICK_TO_CALL_TRIES = 3
     TIMER_PROBE_EVERY_S = 1.5
-    BLIND_CONNECT_AFTER_S = 12.0    # was 60s of dead air on a live call
+    STALE_SURFACE_GRACE_S = 45.0    # replaces the 12s blind connect
     deadline = time.time() + 90.0
 
     presses = 0
@@ -932,20 +1054,32 @@ def _place_call_direct(stub) -> "object | None":
                     log.info("outbound call connected (timer running, %.1fs after dial)",
                              time.time() - t_dial)
                     return _ProbeLike("connected")
-            # Fallback only if the timer probe can't confirm. With the
-            # AUTHORIZED_E164 bug fixed the probe works, so this should be rare.
-            if now - phone_seen_at > BLIND_CONNECT_AFTER_S:
-                log.warning("Phone surface up %.0fs without a readable timer — "
-                            "treating as connected (check facetime-bridge-ax "
-                            "Accessibility permission)", BLIND_CONNECT_AFTER_S)
-                return _ProbeLike("connected")
+                # Timer unreadable ≠ not connected. A live call always
+                # carries banner controls; accept them as the second proof.
+                if _in_call_banner_visible():
+                    log.info("outbound call connected (in-call banner present, "
+                             "%.1fs after dial)", time.time() - t_dial)
+                    return _ProbeLike("connected")
+                # Grace: Phone up well past the prompt window with the press
+                # budget spent and no unanswered prompt on screen. The prompt
+                # check fails SAFE — an unreadable screen counts as visible.
+                if (now - phone_seen_at > STALE_SURFACE_GRACE_S
+                        and presses >= CLICK_TO_CALL_TRIES
+                        and not _click_to_call_prompt_visible()):
+                    log.warning("connect unproven, proceeding on "
+                                "stale-surface heuristic (Phone up %.0fs, "
+                                "no timer, no banner, no prompt)",
+                                now - phone_seen_at)
+                    return _ProbeLike("connected")
+                if _click_to_call_prompt_visible():
+                    log.info("prompt still unanswered — connect unproven")
         elif phone_seen_at is not None:
             # Surface appeared then vanished — call ended/failed.
             log.info("Phone surface vanished before connect")
             return None
 
         time.sleep(0.25)
-    log.warning("outbound connect wait timed out after 90s")
+    log.warning("outbound connect proof never arrived — cleaning up")
     return None
 
 
@@ -960,45 +1094,62 @@ class _ProbeLike:
 def _press_click_to_call_if_present() -> bool:
     """Press the NEWEST 'Call' button on a 'Click to Call' prompt.
 
-    Uses the same Accessibility channel as the daemon. CRITICAL (2026-09-06
-    lesson): each failed attempt leaves a stale 'Click to Call' banner in the
-    Notification Center tray. Pressing the FIRST match presses the STALE
-    banner — the fresh prompt expires (~20s) and the call dies. So: collect
-    ALL matching buttons, press the LAST (newest) first, verify the call
-    engaged via the timer, and only then report success.
+    2026-09-08 (issue #6): System Events cannot see Notification Center
+    banner buttons on macOS 26 ('entire contents' blind — re-confirmed on
+    two live calls), so the AppleScript press NEVER fired. The bridge's
+    ax2 helper CAN see them: try its --ax-press first (it presses the
+    NEWEST enabled pressable node matching 'Call' in the named process),
+    then fall back to one frames-snapshot + cliclick at the computed
+    button center.
+
+    A failed attempt leaves a STALE banner in the NC tray and the fresh
+    prompt arrives after it — the newest match is the only safe target.
+    ax2 already prefers the newest node; the frames fallback mirrors that
+    (last match wins, matching dump order).
     """
     import subprocess as _sp
-    collect = (
-        'tell application "System Events"\n'
-        '  tell process "Notification Center"\n'
-        '    set hitList to {}\n'
-        '    repeat with elem in UI elements\n'
-        '      try\n'
-        '        set elemDesc to entire contents of elem\n'
-        '        repeat with d in elemDesc\n'
-        '          try\n'
-        '            if role of d is "AXButton" and description of d contains "Call" then\n'
-        '              set end of hitList to d\n'
-        '            end if\n'
-        '          end try\n'
-        '        end repeat\n'
-        '      end try\n'
-        '    end repeat\n'
-        '    set n to count of hitList\n'
-        '    if n is 0 then return "none"\n'
-        '    perform action "AXPress" of item n of hitList\n'
-        '    return "pressed" & n\n'
-        '  end tell\n'
-        'end tell'
-    )
+    ax2 = _ax2_path()
     try:
-        r = _sp.run(["osascript", "-e", collect], capture_output=True, text=True, timeout=20)
-        out = (r.stdout or "").strip()
-        if out.startswith("pressed"):
-            log.info("pressed Click-to-Call prompt (banner #%s)", out[7:])
+        r = _sp.run(
+            [ax2, "--ax-press", "--process", "Notification Center",
+             "--contains", "Call"],
+            capture_output=True, text=True, timeout=20, env=_ax2_env(),
+        )
+        out = json.loads((r.stdout or "{}"))
+        if out.get("pressed"):
+            log.info("pressed Click-to-Call prompt via ax2 (matched: %s)",
+                     out.get("matched", ""))
             return True
+        log.info("ax2 --ax-press found no 'Call' node (reason: %s)",
+                 out.get("reason", r.stderr or "?"))
     except Exception as e:
-        log.warning("click-to-call press failed: %s", e)
+        log.warning("ax2 --ax-press failed (%s): %s", type(e).__name__, e)
+
+    # ONE fallback: frames snapshot → newest 'Call' node → cliclick center.
+    try:
+        surfaces = _ax2_snapshot_frames()
+    except Exception as e:
+        log.warning("click-to-call frames snapshot failed (%s): %s",
+                    type(e).__name__, e)
+        return False
+    node = _newest_call_node(surfaces)
+    if node is None:
+        log.info("no pressable 'Call' node with a frame — nothing to press")
+        return False
+    f = node["frame"]
+    x = int(f["x"] + f["w"] / 2)
+    y = int(f["y"] + f["h"] / 2)
+    log.info("ax-press fallback: cliclick at (%d,%d) on %r",
+             x, y, " | ".join([str(t) for t in (node.get("texts") or [])])[:80])
+    try:
+        click = _sp.run(["cliclick", f"c:{x},{y}"],
+                        capture_output=True, text=True, timeout=10)
+        if click.returncode == 0:
+            return True
+        log.warning("cliclick failed (rc=%d): %s",
+                    click.returncode, (click.stderr or click.stdout or "").strip())
+    except Exception as e:
+        log.warning("cliclick click failed: %s", e)
     return False
 
 
@@ -1034,6 +1185,139 @@ def _call_timer_running() -> bool:
     except Exception as e:
         log.warning("call-timer probe failed (%s): %s", type(e).__name__, e)
         return False
+
+
+# In-call banner mic-control vocabulary. 'muted'/'unmute' imply the mic is
+# CURRENTLY muted (the control offers to unmute); a bare 'mute' label alone
+# does not — a MUTE toggle says nothing about which side it is on.
+_MUTED_HINTS = ("muted", "unmute")
+_UNMUTED_HINTS = ("unmuted",)
+_MUTE_ANY = ("mute",)
+
+
+def _banner_mute_state(surfaces) -> str:
+    """Classify the in-call banner mic control: 'muted'|'unmuted'|'unknown'.
+
+    Logs every matching node's raw texts verbatim at INFO — the wording of
+    the control is not assumed, only recorded, and re-classified here if the
+    live wording ever drifts.
+    """
+    found = False
+    for s in (surfaces or []):
+        if (s.get("process") or "") != "Notification Center":
+            continue
+        texts = [str(t) for t in (s.get("texts") or [])]
+        label = str(s.get("label") or "")
+        ident = str(s.get("identifier") or "")
+        hay = " ".join(texts + [label, ident])
+        if not any(w in hay.lower() for w in _MUTE_ANY):
+            continue
+        found = True
+        log.info("mute-control node found: texts=%r label=%r identifier=%r "
+                 "actions=%r enabled=%r", texts, label, ident,
+                 s.get("actions"), s.get("enabled"))
+        low = hay.lower()
+        # ORDER MATTERS: 'unmuted' contains 'muted' as a substring, so the
+        # unmuted check must run first or every unmuted control reads muted.
+        if any(h in low for h in _UNMUTED_HINTS):
+            return "unmuted"
+        if any(h in low for h in _MUTED_HINTS):
+            return "muted"
+    if not found:
+        log.info("no mute-control node in the in-call banner snapshot")
+    return "unknown"
+
+
+def _ensure_outbound_mic_unmuted(session=None) -> str:
+    """Prove (or force) the outbound mic unmuted right after connect.
+
+    2026-09-08 live call: the in-call banner mic icon was SLASHED from the
+    first second — TTS played into a muted mic for 85s and the callee heard
+    nothing. This runs exactly once per outbound call, immediately after
+    connect is confirmed, and NEVER raises: a failure here must degrade to a
+    log line, not kill the call path.
+
+    Order: ax2 snapshot to classify the banner mic control → if it reads
+    muted, ax2 press + re-snapshot to verify → System Events Video>Mute
+    menu toggle as the fallback (SE CAN read app menus, unlike NC banners;
+    AXMenuItemMarkChar reads 'missing value' before AND after on this build
+    — logged as inconclusive).
+
+    Returns the final state: 'unmuted' | 'unknown'.
+    """
+    method = "none"
+    state = "unknown"
+    try:
+        # (a) Snapshot and classify. Log everything found verbatim — do not
+        # assume semantics from partial wording.
+        surfaces = _ax2_snapshot_frames()
+        state = _banner_mute_state(surfaces)
+        log.info("outbound mic state per banner: %s", state)
+
+        if state == "muted":
+            import subprocess as _sp
+            log.info("banner shows mic MUTED — pressing the mute control")
+            try:
+                r = _sp.run(
+                    [_ax2_path(), "--ax-press", "--process",
+                     "Notification Center", "--contains", "Mute"],
+                    capture_output=True, text=True, timeout=20, env=_ax2_env(),
+                )
+                out = json.loads((r.stdout or "{}"))
+                log.info("ax2 mute press: %r", out)
+                method = "ax2-press"
+                # (b) RE-SNAPSHOT to verify the muted indication is gone.
+                after = _banner_mute_state(_ax2_snapshot_frames())
+                log.info("post-press banner mute state: %s", after)
+                if after == "unmuted":
+                    state = "unmuted"
+                elif after == "muted":
+                    log.warning("banner still reads muted after press")
+                else:
+                    # Pressed but the banner no longer classifies — treat
+                    # the press as taken effect rather than press again.
+                    state = "unmuted"
+            except Exception as e:
+                log.warning("ax2 mute press failed: %s", e)
+
+        if state != "unmuted":
+            # (c) Fallback: FaceTime's own Video > Mute menu via System
+            # Events. SE cannot see NC banners but CAN read app menus.
+            method = "menu-toggle"
+            try:
+                import subprocess as _sp
+                before = (
+                    'tell application "System Events" to tell process '
+                    '"FaceTime" to get value of attribute "AXMenuItemMarkChar" '
+                    'of menu item "Mute" of menu 1 of menu bar item "Video" '
+                    'of menu bar 1'
+                )
+                click = (
+                    'tell application "System Events" to tell process '
+                    '"FaceTime" to click menu item "Mute" of menu 1 of menu '
+                    'bar item "Video" of menu bar 1'
+                )
+                r0 = _sp.run(["osascript", "-e", before],
+                             capture_output=True, text=True, timeout=10)
+                log.info("menu AXMenuItemMarkChar BEFORE: %r", (r0.stdout or "").strip())
+                _sp.run(["osascript", "-e", click],
+                        capture_output=True, text=True, timeout=10)
+                r1 = _sp.run(["osascript", "-e", before],
+                             capture_output=True, text=True, timeout=10)
+                log.info("menu AXMenuItemMarkChar AFTER: %r", (r1.stdout or "").strip())
+            except Exception as e:
+                log.warning("menu-toggle unmute failed: %s", e)
+    except Exception as e:
+        # NEVER raise: a probe failure must not kill the call path.
+        log.warning("mic-unmute check could not run: %s", e)
+    finally:
+        # (d) Exactly one summary line, always. 'no' = we KNOW the mic is
+        # still muted; 'unknown' = state never classified.
+        verdict = ("yes" if state == "unmuted"
+                   else "no" if state == "muted" else "unknown")
+        fn = log.info if state == "unmuted" else log.warning
+        fn("outbound mic unmuted: %s (method=%s)", verdict, method)
+    return state
 
 
 def _run_call(session, was_outbound: bool, stub) -> None:
@@ -1375,6 +1659,10 @@ def main() -> int:
                 _mark_trigger_result({"ok": False, "error": "call failed to place or connect"})
                 continue
             log.info("outbound call connected")
+            # Issue #6 fix 3: exactly once per outbound call, right after
+            # connect is confirmed — tonight's call ran 85s mic-muted.
+            # Never raises; worst case is a log line.
+            _ensure_outbound_mic_unmuted()
             _mark_trigger_result({"ok": True, "state": "connected"})
             was_outbound = True
         else:
