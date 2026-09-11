@@ -74,7 +74,10 @@ TOOL_TOOLSETS = ["file", "web", "search", "terminal", "session_search", "memory"
 #
 # Chat gains nothing from deliberation, so the fast tier turns it off outright.
 # The tool tier keeps a little, where it genuinely helps pick the right tool.
-FAST_REASONING_EFFORT = os.environ.get("DFV_REASONING_EFFORT_FAST", "none")
+# 2026-09-11: "none" makes glm-5.3-flash (ollama-cloud) emit its reasoning as
+# untagged CONTENT — DATA would speak his thoughts aloud. "low" is separated
+# cleanly by the provider. Measured on DATA's host; see voice_agent.py.
+FAST_REASONING_EFFORT = os.environ.get("DFV_REASONING_EFFORT_FAST", "low")
 FULL_REASONING_EFFORT = os.environ.get(
     "DFV_REASONING_EFFORT", os.environ.get("DFV_REASONING_EFFORT_FULL", "low"))
 
@@ -134,7 +137,7 @@ def _voice_system_prompt() -> str:
         sys.path.insert(0, DFV_DIR)
     try:
         from voice_persona import SYSTEM_CONTEXT
-        return SYSTEM_CONTEXT
+        return SYSTEM_CONTEXT + VOICE_BREVITY_PROMPT
     except Exception:
         # voice_loop imports grpc/numpy; if this worker's venv lacks them the
         # import fails. Never let that take the whole worker down silently —
@@ -145,7 +148,19 @@ def _voice_system_prompt() -> str:
             "pipeline. Calm, precise, dry wit. 'Sir' or 'Captain' at most once "
             "per reply. Voice-friendly: no markdown, no code, no URLs. SHORT: "
             "1-3 sentences by default."
-        )
+        ) + VOICE_BREVITY_PROMPT
+
+
+# 2026-09-09 (call-4): DATA's replies ran 25-38s of continuous TTS before
+# Captain could barge in. Persona rules ('1-3 sentences by default') were not
+# enough — the model reads 'by default' as negotiable on any substantive
+# question. This suffix is unconditional and applies to EVERY voice turn on
+# both tiers (it rides _voice_system_prompt, which both agents share).
+VOICE_BREVITY_PROMPT = (
+    " You are on a LIVE PHONE CALL. Reply in AT MOST 2 short sentences. "
+    "No lists, no markdown, no tool talk. Stop talking after the answer; "
+    "the Captain will ask if he wants more."
+)
 
 
 def _build_agent(toolsets, reasoning_effort):
@@ -264,19 +279,17 @@ def process_request(request: dict) -> dict:
 
 
 def main():
-    sys.stdout.write(json.dumps({"status": "ready"}) + "\n")
+    # Pre-warm BOTH agents BEFORE announcing ready — construction + memory load
+    # + toolset build happen here, not on the Captain's first words. (Measured
+    # 2026-09-11: with 'ready' printed first, the first turn paid 7-25s.)
+    errors = {}
+    for name, fn in (("fast", _ensure_fast), ("full", _ensure_full)):
+        try:
+            fn()
+        except Exception as e:
+            errors[name] = f"{type(e).__name__}: {e}"
+    sys.stdout.write(json.dumps({"status": "ready", "errors": errors}) + "\n")
     sys.stdout.flush()
-    # Pre-warm BOTH agents once — construction + memory load + toolset build
-    # happen HERE, not on Captain's first words. The fast agent is built first
-    # because it serves the first turn of nearly every call.
-    try:
-        _ensure_fast()
-    except Exception:
-        pass
-    try:
-        _ensure_full()
-    except Exception:
-        pass
     while True:
         line = sys.stdin.readline()
         if not line:

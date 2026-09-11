@@ -19,6 +19,7 @@ Run:  python test_connect_proof.py     (exit 0 = pass)
 import json
 import os
 import sys
+import threading
 import time
 import unittest
 from unittest import mock
@@ -831,6 +832,229 @@ run("14. overlapping utterance queued (not dropped), runs after release",
     t14_overlapping_utterance_queued_not_dropped)
 
 
+def t15_probe_phone_grace():
+    """Call-4 latency: probe-'connected' + Phone-up>=12s + no prompt connects
+    WITHOUT the AX timer/banner proofs (they are unreadable on macOS 26)."""
+    clock = {"t": 1000.0}
+
+    class FakeStub:
+        def __init__(self):
+            self.calls = 0
+
+        def Control(self, req):  # noqa: N802 (grpc style)
+            self.calls += 1
+            return vl._ProbeLike("connected")
+
+    stub = FakeStub()
+    orig_sleep = vl.time.sleep
+
+    def fake_time():
+        return clock["t"]
+
+    def bump(s):
+        clock["t"] += 0.5
+
+    with mock.patch.object(vl.time, "time", fake_time), \
+            mock.patch.object(vl.time, "sleep", bump), \
+            mock.patch.object(vl, "AUTHORIZED_E164", "+19374814211"), \
+            mock.patch.object(vl, "_call_timer_running", return_value=False), \
+            mock.patch.object(vl, "_in_call_banner_visible", return_value=False), \
+            mock.patch.object(vl, "_click_to_call_prompt_visible", return_value=False), \
+            mock.patch("subprocess.run",
+                       side_effect=lambda a, **k: run_result(returncode=0)):
+        # Press window must be spent: pretend the dial happened 30s ago.
+        clock["t"] -= 30.0
+        result = []
+        done = threading.Event()
+
+        def target():
+            try:
+                result.append(vl._place_call_direct(stub))
+            except Exception as e:  # pragma: no cover
+                result.append(e)
+            finally:
+                done.set()
+
+        th = threading.Thread(target=target, daemon=True)
+        th.start()
+        assert done.wait(20), "loop did not terminate"
+        time.sleep(0.05)
+    r = result[0]
+    assert isinstance(r, vl._ProbeLike) and r.state == "connected", \
+        f"probe+phone grace should connect, got {r!r}"
+    assert stub.calls > 0, "probe must have been sampled during the wait"
+    print("  probe+phone grace: probe connected + Phone-up 12s -> connect "
+          f"(probe samples: {stub.calls})")
+
+
+def t15b_probe_idle_keeps_stale_heuristic():
+    """Probe never 'connected' -> connect only via the 45s stale path."""
+    clock = {"t": 2000.0}
+
+    class FakeStub:
+        def Control(self, req):
+            return vl._ProbeLike("idle")
+
+    stub = FakeStub()
+    orig_sleep = vl.time.sleep
+
+    def fake_time():
+        return clock["t"]
+
+    def bump(s):
+        clock["t"] += 0.5
+
+    with mock.patch.object(vl.time, "time", fake_time), \
+            mock.patch.object(vl.time, "sleep", bump), \
+            mock.patch.object(vl, "AUTHORIZED_E164", "+19374814211"), \
+            mock.patch.object(vl, "_call_timer_running", return_value=False), \
+            mock.patch.object(vl, "_in_call_banner_visible", return_value=False), \
+            mock.patch.object(vl, "_click_to_call_prompt_visible", return_value=False), \
+            mock.patch("subprocess.run",
+                       side_effect=lambda a, **k: run_result(returncode=0)):
+        clock["t"] -= 30.0
+        result = []
+        done = threading.Event()
+
+        def target():
+            try:
+                result.append(vl._place_call_direct(stub))
+            except Exception as e:  # pragma: no cover
+                result.append(e)
+            finally:
+                done.set()
+
+        th = threading.Thread(target=target, daemon=True)
+        th.start()
+        assert done.wait(30), "loop did not terminate"
+        time.sleep(0.05)
+    assert isinstance(result[0], vl._ProbeLike) and result[0].state == "connected", \
+        f"stale heuristic should still connect at 45s, got {result[0]!r}"
+    print("  probe stays idle: 45s stale-surface heuristic still connects")
+
+
+def t15c_prompt_visible_blocks_probe_connect():
+    """Ghost fail-safe: a visible prompt NEVER fakes connect, even on probe."""
+    clock = {"t": 3000.0}
+
+    class FakeStub:
+        def Control(self, req):
+            return vl._ProbeLike("connected")
+
+    stub = FakeStub()
+    orig_sleep = vl.time.sleep
+
+    def fake_time():
+        return clock["t"]
+
+    def bump(s):
+        clock["t"] += 0.5
+
+    with mock.patch.object(vl.time, "time", fake_time), \
+            mock.patch.object(vl.time, "sleep", bump), \
+            mock.patch.object(vl, "AUTHORIZED_E164", "+19374814211"), \
+            mock.patch.object(vl, "_call_timer_running", return_value=False), \
+            mock.patch.object(vl, "_in_call_banner_visible", return_value=False), \
+            mock.patch.object(vl, "_click_to_call_prompt_visible", return_value=True), \
+            mock.patch("subprocess.run",
+                       side_effect=lambda a, **k: run_result(returncode=0)):
+        clock["t"] -= 30.0
+        result = []
+        done = threading.Event()
+
+        def target():
+            try:
+                result.append(vl._place_call_direct(stub))
+            except Exception as e:  # pragma: no cover
+                result.append(e)
+            finally:
+                done.set()
+
+        th = threading.Thread(target=target, daemon=True)
+        th.start()
+        assert done.wait(30), "loop did not terminate"
+        time.sleep(0.05)
+    assert result[0] is None, \
+        f"visible prompt must block any connect, got {result[0]!r}"
+    print("  visible prompt blocks probe-connect (ghost fail-safe preserved)")
+
+
+def t16_sentence_cap_and_preload_contract():
+    """Call-4 brevity: DFV_MAX_SENTENCES backstop fires at N sentences, the
+    closing line speaks, the turn RETURNS (not a barge-in raise), and the
+    greeting preload contract holds (split == GREETING_SENTENCES, all
+    preloaded — the 4.4s cache-miss regression)."""
+    assert vl.split_sentences(vl.GREETING_LINE) == vl.GREETING_SENTENCES, \
+        "greeting preload contract broken: split != GREETING_SENTENCES"
+    for s in vl.GREETING_SENTENCES:
+        assert s in vl.PRELOAD_PHRASES, f"greeting sentence not preloaded: {s!r}"
+    assert vl.VOICE_CAP_CLOSING_LINE in vl.PRELOAD_PHRASES, \
+        "closing line must be preloaded (0ms render)"
+
+    class FakeStd:
+        def write(self, data):
+            pass
+
+        def flush(self):
+            pass
+
+    class FakeProc:
+        stdin = None
+
+        def __init__(self):
+            self.stdin = FakeStd()
+            self.n = 0
+
+        def readline(self):
+            self.n += 1
+            if self.n <= vl.DFV_MAX_SENTENCES + 4:
+                return json.dumps(
+                    {"delta": f"Sentence {self.n} of a very long reply. "}) + "\n"
+            return ""
+
+        def kill(self):
+            pass
+
+    spoken = []
+    fake_proc = FakeProc()
+    fake_proc.stdout = fake_proc  # readline lives on the proc; stdout alias
+
+    # Real speak() only raises on barge-in; the cap branch raises itself.
+    # The fake therefore NEVER raises — it records what would be spoken.
+    def fake_speak(text, is_final=False):
+        spoken.append((text, is_final))
+
+    with mock.patch.object(vl, "_ensure_worker", lambda: None), \
+            mock.patch.object(vl, "_worker_proc", fake_proc):
+        try:
+            text = vl.llm_reply_streaming("test prompt", speak=fake_speak,
+                                          cancelled=lambda: False)
+            raised = False
+        except vl.TTSCanceled:
+            raised = True
+            text = None
+    non_final = [t for t, f in spoken if not f]
+    assert len(non_final) == vl.DFV_MAX_SENTENCES, \
+        f"cap must stop at {vl.DFV_MAX_SENTENCES} sentences, spoke {len(non_final)}"
+    assert any(t == vl.VOICE_CAP_CLOSING_LINE for t, f in spoken), \
+        "closing line must be spoken after the cap"
+    # Capped turns must NOT re-raise as barge-in (tail fix): the call returned
+    # normally with the capped text.
+    assert raised is False and text is not None and "Sentence 3" in text, \
+        f"capped turn must return normally, got raised={raised} text={text!r}"
+    assert vl.DFV_MAX_SENTENCES == 3, "cap default drifted"
+    print("  sentence cap: "
+          f"{len(non_final)} sentences + closing line; returns normally "
+          f"(transcript path intact)")
+
+run("15. probe+phone 12s grace connects without AX proof",
+    t15_probe_phone_grace)
+run("15b. probe idle -> 45s stale heuristic still governs",
+    t15b_probe_idle_keeps_stale_heuristic)
+run("15c. prompt visible -> no probe connect (ghost fail-safe)",
+    t15c_prompt_visible_blocks_probe_connect)
+run("16. voice brevity cap fires at N sentences with closing line",
+    t16_sentence_cap_and_preload_contract)
 # pytest-compat: module-level checks above run at import; the unittest bridge
 # below lets pytest collect a real test that reflects the ok flag, while the
 # direct script run keeps its documented `python test_connect_proof.py` exit.

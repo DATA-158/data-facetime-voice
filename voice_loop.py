@@ -107,6 +107,15 @@ MAX_UTTERANCE_MS = 30_000
 # system default voice — the Captain's pick, and not to be changed.
 TTS_VOICE = tts_engine.TTS_VOICE
 MAX_TURNS = 200
+# 2026-09-09 (call-4 voice brevity): hard cap on streamed-reply sentences.
+# After DFV_MAX_SENTENCES are spoken, the turn ends at the next sentence
+# boundary and VOICE_CAP_CLOSING_LINE goes out. Prompt-level brevity
+# (hermes_worker VOICE_BREVITY_PROMPT) is the first line of defense; this is
+# the guaranteed backstop.
+DFV_MAX_SENTENCES = int(os.environ.get("DFV_MAX_SENTENCES", "3"))
+VOICE_CAP_CLOSING_LINE = os.environ.get(
+    "DFV_VOICE_CAP_CLOSING_LINE", "Full details on iMessage, Captain."
+)
 
 # Spoken when a turn yields nothing sayable. A live call must never go silent:
 # the caller cannot see the log, so an audible failure beats dead air.
@@ -115,10 +124,22 @@ TURN_FAILED_LINE = os.environ.get(
     "Captain, I lost that one. Say again?",
 )
 # Spoken when an outbound call connects, so the Captain does not answer to dead air.
+# 2026-09-09 (call-4): ONE sentence, verbatim. The greeting is the first audio
+# of the call — every extra sentence is another ~1.3s before the caller hears
+# anything, and a two-line greeting also broke the preload contract (see
+# GREETING_SENTENCES below: the cache stores the FULL line, the loop speaks
+# per-sentence — that mismatch put ~4.4s of `say` renders back on the
+# critical path at connect, on top of the greeting being preloaded).
 GREETING_LINE = os.environ.get(
     "DFV_GREETING_LINE",
-    "Captain, DATA here. The line is live — go ahead.",
+    "DATA here — go ahead, Captain.",
 )
+# What the greeting actually SPEAKS. Kept as a list so the preload can store
+# exactly these strings: GREETING_SENTENCES must be the sentence split of
+# GREETING_LINE, or the preload is wasted work and connect-day renders happen
+# anyway (the measured 4.4s ready->first-packet gap, call 4 17:40:35.5->
+# 17:40:39.9). split_sentences() on GREETING_LINE and this MUST stay equal.
+GREETING_SENTENCES = [GREETING_LINE]
 # Must match hermes_worker's DFV_TOOL_FILLER — the worker chooses when to say it,
 # but the voice loop is what synthesizes it, so it preloads it here.
 TOOL_FILLER_LINE = os.environ.get("DFV_TOOL_FILLER", "Let me check that, Captain.")
@@ -133,8 +154,11 @@ PLAYBACK_WARN_LINE = os.environ.get(
 # Fixed lines are spoken verbatim over and over, and are often the FIRST audio of
 # a turn — on a tool turn the filler is all the caller hears until the agent loop
 # finishes. Pre-synthesizing them takes that cost off the critical path.
-PRELOAD_PHRASES = [TURN_FAILED_LINE, GREETING_LINE, TOOL_FILLER_LINE,
-                   PLAYBACK_WARN_LINE]
+# 2026-09-09 (call-4): the greeting is preloaded as its SPOKEN SENTENCES, not
+# the raw line — the cache is keyed by what tts_sentences() actually passes to
+# synthesize(), and a preload under a different key renders nothing.
+PRELOAD_PHRASES = [TURN_FAILED_LINE, *GREETING_SENTENCES, TOOL_FILLER_LINE,
+                   PLAYBACK_WARN_LINE, VOICE_CAP_CLOSING_LINE]
 
 # Silence RMS floor applied to utterance audio before STT (caller holds-open
 # mic + BlackHole loop can carry a faint DC/noise floor).
@@ -1142,10 +1166,12 @@ def _place_call_direct(stub) -> "object | None":
       button ourselves (single deliberate press, same AX channel as daemon).
     - The daemon probe reads OUTBOUND calls as idle the entire time (the
       outbound surface carries no caller identity, fail-closed classifier).
-      So we can't use PROBE for the connect wait. Instead watch the Phone
-      process: it spawns when the call UI engages (dialing or connected) and
-      dies when the call ends. 'connected' = Phone alive + running call timer
-      in the AX snapshot ('FaceTime Audio M:SS' with a nonzero/updating time).
+      2026-09-09 (call 4) REVISION: that held for the old wait-for-answer
+      use, but during the 17:40:00-17:40:34 window the probe is a usable
+      AX-free signal for the connect wait — see the probe+phone grace below.
+      Primary proof is unchanged: watch the Phone process (spawns when the
+      call UI engages, dies when the call ends) + a running call timer in
+      the AX snapshot ('FaceTime Audio M:SS' with a nonzero/updating time).
     """
     import subprocess as _sp
     if not AUTHORIZED_E164:
@@ -1175,13 +1201,29 @@ def _place_call_direct(stub) -> "object | None":
     CLICK_TO_CALL_WINDOW_S = 20.0   # prompt appears within ~10s if at all
     CLICK_TO_CALL_TRIES = 3
     TIMER_PROBE_EVERY_S = 1.5
-    STALE_SURFACE_GRACE_S = 45.0    # replaces the 12s blind connect
+    STALE_SURFACE_GRACE_S = 45.0    # no probe signal: keep the honest heuristic
+    # 2026-09-09 (call-4 latency): the 45s grace was the DOMINANT connect
+    # cost — calls 2-4 all rode it (timer/banner unreadable on macOS 26,
+    # Phone up 45-47s). The daemon's Control(PROBE) is a second, AX-free
+    # connect signal: when it reports 'connected' during the wait, the only
+    # thing left unproven is the surface, and Phone-up is that surface.
+    # Probe-connected + Phone-up 12s = connect (logged as probe+phone grace).
+    # The probe was NOT the 09-09-morning ghost risk here: that call was
+    # adopted while RINGING with Phone-up 0s — this path requires the Phone
+    # call surface to have been up STALE_PROBE_PHONE_GRACE_S first.
+    STALE_PROBE_PHONE_GRACE_S = float(
+        os.environ.get("DFV_PROBE_PHONE_GRACE_S", "12"))
+    PROBE_EVERY_S = 2.0             # probe poll cadence during the wait
+    PROBE_LOG_EVERY = 5             # log every Nth probe sample (data, not spam)
     deadline = time.time() + 90.0
 
     presses = 0
     next_press_at = t_dial + 3.0
     phone_seen_at = None
     next_timer_probe = 0.0
+    probe_seen_at = None            # first probe-'connected' sighting
+    probe_samples = 0
+    next_probe_at = 0.0
 
     while time.time() < deadline:
         now = time.time()
@@ -1225,17 +1267,48 @@ def _place_call_direct(stub) -> "object | None":
                     log.info("outbound call connected (in-call banner present, "
                              "%.1fs after dial)", time.time() - t_dial)
                     return _ProbeLike("connected")
-                # Grace: Phone up well past the prompt window with the press
-                # budget spent and no unanswered prompt on screen. The prompt
-                # check fails SAFE — an unreadable screen counts as visible.
-                if (now - phone_seen_at > STALE_SURFACE_GRACE_S
-                        and presses >= CLICK_TO_CALL_TRIES
-                        and not _click_to_call_prompt_visible()):
-                    log.warning("connect unproven, proceeding on "
-                                "stale-surface heuristic (Phone up %.0fs, "
-                                "no timer, no banner, no prompt)",
-                                now - phone_seen_at)
-                    return _ProbeLike("connected")
+                # 2026-09-09 (call-4): AX-free second connect signal. Poll the
+                # daemon probe on a side channel; every sample is counted so
+                # the post-call autopsy always has the probe timeline. Errors
+                # are swallowed — the probe may be busy serving the real
+                # call's audio session.
+                if now >= next_probe_at:
+                    next_probe_at = now + PROBE_EVERY_S
+                    probe_samples += 1
+                    try:
+                        ppr = stub.Control(
+                            pb.ControlRequest(command=pb.CONTROL_COMMAND_PROBE))
+                    except Exception as e:
+                        log.debug("connect-wait probe failed (%s)", e)
+                    else:
+                        if probe_samples % PROBE_LOG_EVERY == 0 or ppr.state == "connected":
+                            log.info("connect-wait probe sample #%d: state=%s "
+                                     "(Phone up %.0fs)", probe_samples,
+                                     ppr.state, now - phone_seen_at)
+                        if ppr.state == "connected" and probe_seen_at is None:
+                            probe_seen_at = now
+                            log.info("probe reports connected (Phone up %.1fs) "
+                                     "— starting %ss probe+phone grace",
+                                     now - phone_seen_at,
+                                     STALE_PROBE_PHONE_GRACE_S)
+                # Grace, probe-assisted: probe-'connected' + Phone up 12s is
+                # connect (probe-connected + Phone-up = proof). Without the
+                # probe signal the old 45s stale-surface heuristic still
+                # applies. A visible prompt NEVER fakes a connect in either.
+                if (not _click_to_call_prompt_visible()
+                        and presses >= CLICK_TO_CALL_TRIES):
+                    if (probe_seen_at is not None
+                            and now - phone_seen_at > STALE_PROBE_PHONE_GRACE_S):
+                        log.info("outbound call connected (probe+phone grace: "
+                                 "probe connected %.1fs ago, Phone up %.1fs)",
+                                 now - probe_seen_at, now - phone_seen_at)
+                        return _ProbeLike("connected")
+                    if now - phone_seen_at > STALE_SURFACE_GRACE_S:
+                        log.warning("connect unproven, proceeding on "
+                                    "stale-surface heuristic (Phone up %.0fs, "
+                                    "no timer, no banner, no prompt)",
+                                    now - phone_seen_at)
+                        return _ProbeLike("connected")
                 if _click_to_call_prompt_visible():
                     log.info("prompt still unanswered — connect unproven")
         elif phone_seen_at is not None:
@@ -1600,8 +1673,14 @@ def _run_call(session, was_outbound: bool, stub,
         barged = False
         try:
             session.playing.set()
+            # 2026-09-09 (call-4): speak the preloaded GREETING_SENTENCES
+            # directly. The old split_sentences(GREETING_LINE) rebuilt the
+            # list at call time; with the one-sentence default they agree,
+            # but an env override (DFV_GREETING_LINE) silently desyncs the
+            # preload contract — speaking the constant's own sentence list
+            # keeps the cache-hit guarantee on every greeting.
             tts_sentences(
-                split_sentences(GREETING_LINE),
+                GREETING_SENTENCES,
                 emit=session._emit_speech,
                 cancelled=lambda: session.barge_in.is_set(),
             )
@@ -1828,6 +1907,15 @@ def llm_reply_streaming(user_text: str, speak, cancelled) -> str:
     spoke_anything = False
     tier = "fast"
     canceled = False
+    # 2026-09-09 (call-4 voice brevity): hard backstop on monologue turns.
+    # After MAX_VOICE_SENTENCES are spoken, the NEXT sentence boundary ends
+    # the audible turn: the rest of the stream is drained (never spoken),
+    # the closing line goes out, and the full text still lands in the
+    # transcript. Prompt-level brevity (hermes_worker VOICE_BREVITY_PROMPT)
+    # is the first line of defense; this is the guaranteed one.
+    max_sentences = DFV_MAX_SENTENCES
+    capped = False
+    spoken_count = 0
     global _worker_proc
     # PIPE-CLEANLINESS INVARIANT: _worker_lock may only release after the
     # turn's {"content"|"error"} terminator line has been consumed (or the
@@ -1896,6 +1984,19 @@ def llm_reply_streaming(user_text: str, speak, cancelled) -> str:
                             spoke_reply = True
                             spoke_anything = True
                             speak(s.strip(), is_final=False)
+                            spoken_count += 1
+                            if spoken_count >= max_sentences and not capped:
+                                # VOICE BREVITY CAP (call-4): N sentences
+                                # spoken — stop at this sentence boundary.
+                                # raise TTSCanceled cancels FURTHER speech;
+                                # _drain_cancelled_stream swallows the rest
+                                # of the stream to the terminator; the
+                                # closing line + transcript logging happen
+                                # in the handlers below.
+                                capped = True
+                                log.info("reply capped at %d sentences "
+                                         "(voice brevity)", max_sentences)
+                                raise TTSCanceled()
                 elif "content" in msg or "error" in msg:
                     # The terminator is consumed: the pipe is clean no matter
                     # what speaking does from here on.
@@ -1936,6 +2037,17 @@ def llm_reply_streaming(user_text: str, speak, cancelled) -> str:
                     break
         except TTSCanceled:
             canceled = True
+            if capped:
+                # BREVITY CAP, not a barge-in: the caller is still listening.
+                # The drain already swallowed the surplus stream (finally
+                # below); speak the closing line so the turn ends on purpose,
+                # not in dead air.
+                log.info("voice brevity cap fired after %d sentence(s)",
+                         spoken_count)
+                try:
+                    speak(VOICE_CAP_CLOSING_LINE, is_final=True)
+                except Exception:
+                    log.exception("brevity-cap closing line failed to speak")
         except json.JSONDecodeError:
             # Malformed line mid-stream: the pipe content is untrusted. Kill
             # the worker and surface as RuntimeError so _run_turn speaks the
@@ -1965,6 +2077,18 @@ def llm_reply_streaming(user_text: str, speak, cancelled) -> str:
                 _drain_cancelled_stream()
     elapsed = time.perf_counter() - t0
     if canceled:
+        if capped:
+            # Brevity cap, not a barge-in: the caller heard a complete,
+            # deliberately-ended reply. Record the capped text normally and
+            # return it — a raise here would mislabel the transcript and
+            # trigger the barge-in path in the caller.
+            text = " ".join(collected).strip()
+            with _dialogue_lock:
+                _dialogue.append({"role": "assistant",
+                                  "content": text + f" [capped at {spoken_count} sentences]"})
+            log.info("streaming turn [brevity-capped at %d sentence(s)]: %.2fs",
+                     spoken_count, elapsed)
+            return text
         with _dialogue_lock:
             _dialogue.append({
                 "role": "assistant",
