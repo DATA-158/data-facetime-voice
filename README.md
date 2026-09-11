@@ -84,11 +84,11 @@ Anyone else rings out.
    2–6 s. Per-app: FaceTime.app and Phone.app Video menu → mic BlackHole 2ch,
    output BlackHole 16ch (already set; honored).
 5. **The Click-to-Call card on macOS 26.6 shows the contact NAME, not the
-   number.** The daemon authorizes it via `FACETIME_BRIDGE_AUTHORIZED_CALLER_NAME`
-   (`promptNameIdentity`, same trust model as the incoming-ring patch).
-   Until that build is installed and granted Accessibility, `voice_agent`
-   presses the button itself (`DFV_AX_PRESS_SHIM=1`, needs AX trust for
-   `~/.local/bin/facetime-bridge-ax3` in the service's context).
+   number.** The daemon (`facetime-bridge-ax4`) authorizes it via
+   `FACETIME_BRIDGE_AUTHORIZED_CALLER_NAME` (`promptNameIdentity`, same trust
+   model as the incoming-ring patch). Each new daemon binary needs its own
+   Accessibility grant, and a plist change needs `launchctl bootout` +
+   `bootstrap` — `kickstart -k` re-runs the old program.
 6. **The system voice is a Siri voice** (`com.apple.siri.natural.Aaron`).
    AVSpeechSynthesizer cannot load Siri voices at all — it silently renders
    Samantha. NSSpeechSynthesizer with voice=nil renders the system voice,

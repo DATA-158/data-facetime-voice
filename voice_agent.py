@@ -81,24 +81,6 @@ STALL_AFTER_S = float(os.environ.get("DFV_STALL_AFTER_S", "3.5"))
 
 log = logging.getLogger("dfv")
 
-AX_PRESS_SHIM = os.environ.get("DFV_AX_PRESS_SHIM", "1") == "1"
-AX_BIN = os.path.expanduser(os.environ.get("DFV_AX_BIN", "~/.local/bin/facetime-bridge-ax3"))
-
-
-def ax_press_call() -> bool:
-    """Press the newest enabled 'Call' button on the Notification Center
-    Click-to-Call card via the bridge binary's --ax-press (see AX_PRESS_SHIM)."""
-    try:
-        r = subprocess.run([AX_BIN, "--ax-press", "--process", "Notification Center", "--contains", "Call"],
-                           capture_output=True, text=True, timeout=20)
-        out = json.loads(r.stdout or "{}")
-        if not out.get("pressed"):
-            log.warning("ax-press: %s %s", out.get("reason"), r.stderr.strip()[-200:])
-        return bool(out.get("pressed"))
-    except Exception as e:
-        log.warning("ax-press failed: %s", e)
-        return False
-
 
 # ---------------------------------------------------------------------------
 # Resampling — small windowed-sinc FIR, then linear pick. Voice band only.
@@ -909,19 +891,8 @@ def main():
                 log.error("CALL rpc failed: %s %s", e.code(), e.details())
             result = f"{r.ok} {r.state} {r.error_code} {r.message}" if r else "rpc-failed"
             log.info("CALL -> %s", result)
-            if r is not None and not r.ok and r.error_code == "PROMPT_TIMEOUT" and AX_PRESS_SHIM:
-                # TEMPORARY (2026-09-11): macOS 26.6 renders the Click-to-Call
-                # card with the contact NAME, not the number, so the daemon's
-                # digits-only authorization can't press it. Until the daemon's
-                # classifier accepts the trusted name on this card (same trust
-                # model as its incoming-ring patch), press the button here.
-                pressed = ax_press_call()
-                log.warning("ax-press shim: pressed=%s", pressed)
-                if pressed:
-                    result = "True dialing AX_PRESS_SHIM pressed Click to Call"
-                    r = None
             TRIGGER.with_suffix(".result").write_text(result + "\n")
-            if r is not None and not r.ok:
+            if not (r and r.ok):
                 continue
         run_call(bridge, vad, tts, stt, worker, outbound=(kind == "outbound"))
 

@@ -21,7 +21,7 @@
 	<string>Interactive</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/Users/YOURUSER/.local/bin/facetime-bridge-ax2</string>
+		<string>/Users/YOURUSER/.local/bin/facetime-bridge-ax4</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
