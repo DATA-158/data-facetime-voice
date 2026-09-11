@@ -210,6 +210,19 @@ class Worker:
         line = self._proc.stdout.readline()
         log.info("worker ready in %.1fs: %s", time.perf_counter() - t, line.strip())
 
+    def refresh(self) -> int:
+        """Reload DATA's recent cross-channel context (call start)."""
+        with self._lock:
+            if self._proc.poll() is not None:
+                self._spawn()
+            self._proc.stdin.write(json.dumps({"refresh": True}) + "\n")
+            self._proc.stdin.flush()
+            line = self._proc.stdout.readline()
+            try:
+                return int(json.loads(line).get("refreshed", 0))
+            except Exception:
+                return 0
+
     def stream(self, prompt: str, on_delta, on_filler, cancelled) -> str:
         """Run one turn. Calls on_delta(text) per delta; returns final text.
         If cancelled() becomes true, drains the rest of the turn quietly."""
@@ -801,6 +814,9 @@ def run_call(bridge, vad, tts, stt, worker, outbound: bool, simulate: bool = Fal
         # Phone.app a moment to open its devices before ours start (the audio
         # law: our engines must start AFTER Phone holds BlackHole 2ch).
         time.sleep(INBOUND_SETTLE_S)
+    t = time.perf_counter()
+    n = worker.refresh()
+    log.info("worker context refreshed: %d recent lines (%.0fms)", n, (time.perf_counter() - t) * 1000)
     call_id = f"dfv-{int(time.time())}"
     audio = AudioSession(bridge, call_id)
     if not audio.ready.wait(30):

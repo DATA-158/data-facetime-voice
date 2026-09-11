@@ -107,9 +107,12 @@ _ACTION_PHRASES = re.compile(
     r"\b(run|rerun|re-run)\s+(the\s+|a\s+|that\s+|this\s+|it\b)?"
     r"(command|script|test|tests|build|make|query|it\b)"
     r"|\b(read|open)\s+(the\s+|my\s+|that\s+)?(file|log|logs|readme|config|doc)"
-    r"|\bwhat'?s?\s+(the\s+)?date\b|\btoday'?s\s+date\b",
+    ,
     re.IGNORECASE,
 )
+# The date/time used to route to the tool tier ("what's the date" -> terminal,
+# 13.8 s on the 2026-09-11 16:44 call). Every prompt now carries a timestamp
+# (see _stamp), so the FAST tier answers it.
 # Conversational openers that would otherwise trip the keyword list.
 _SMALLTALK = re.compile(
     r"^\s*(hey|hi|hello|yo|good (morning|afternoon|evening)|thanks|thank you|"
@@ -163,6 +166,69 @@ VOICE_BREVITY_PROMPT = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Continuity with DATA's other channels (2026-09-11 16:45 call: "we talked
+# about it literally earlier today" — the answer was in the iMessage session
+# at 13:02, in ~/.hermes/state.db, but the voice agent starts with an empty
+# window and session_search picked the wrong query). On every call start the
+# voice loop asks for a refresh; the last 24 h of user/assistant turns from
+# the other channels are appended to the ephemeral system prompt, which
+# Hermes re-reads on each request.
+# ---------------------------------------------------------------------------
+RECENT_HOURS = float(os.environ.get("DFV_RECENT_HOURS", "24"))
+RECENT_MAX_MSGS = int(os.environ.get("DFV_RECENT_MAX_MSGS", "40"))
+RECENT_MAX_CHARS = int(os.environ.get("DFV_RECENT_MAX_CHARS", "240"))
+_EXCLUDED_SOURCES = ("cron", "subagent", "voice")
+
+
+def _recent_context() -> str:
+    """Compact transcript of DATA's recent conversations with the Captain."""
+    import sqlite3
+    db = os.path.join(os.environ["HERMES_HOME"], "state.db")
+    if not os.path.exists(db):
+        return ""
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
+        rows = con.execute(
+            "SELECT s.source, m.role, m.timestamp, m.content FROM messages m "
+            "JOIN sessions s ON s.id = m.session_id "
+            "WHERE m.timestamp > ? AND m.role IN ('user','assistant') "
+            "AND s.source NOT IN (%s) ORDER BY m.timestamp DESC LIMIT ?"
+            % ",".join("?" * len(_EXCLUDED_SOURCES)),
+            (time.time() - RECENT_HOURS * 3600, *_EXCLUDED_SOURCES, RECENT_MAX_MSGS),
+        ).fetchall()
+        con.close()
+    except Exception as e:
+        sys.stderr.write(f"recent-context read failed: {e}\n")
+        return ""
+    lines = []
+    for source, role, ts, content in reversed(rows):
+        if not isinstance(content, str):
+            continue
+        text = " ".join(content.split())
+        if not text or text.startswith("{") or text.startswith("<untrusted"):
+            continue
+        if len(text) > RECENT_MAX_CHARS:
+            text = text[:RECENT_MAX_CHARS - 1] + "…"
+        who = "Captain" if role == "user" else "DATA"
+        lines.append(f"[{time.strftime('%a %H:%M', time.localtime(ts))} {source}] {who}: {text}")
+    if not lines:
+        return ""
+    return ("\n\nRECENT CONVERSATIONS WITH THE CAPTAIN on other channels (last "
+            f"{RECENT_HOURS:.0f}h, oldest first). This is what he means by 'earlier today' — "
+            "answer from it directly before reaching for session_search:\n" + "\n".join(lines))
+
+
+def _refresh_context() -> int:
+    """Re-read recent context into both agents' ephemeral prompt. Returns line count."""
+    ctx = _recent_context()
+    base = _voice_system_prompt()
+    for agent in (_fast_agent, _full_agent):
+        if agent is not None:
+            agent.ephemeral_system_prompt = base + ctx
+    return ctx.count("\n") if ctx else 0
+
+
 def _build_agent(toolsets, reasoning_effort):
     from run_agent import AIAgent
     from hermes_cli.config import load_config
@@ -200,7 +266,7 @@ def _build_agent(toolsets, reasoning_effort):
         credential_pool=info.get("credential_pool"),
         enabled_toolsets=toolsets,
         reasoning_config=reasoning_config,
-        ephemeral_system_prompt=_voice_system_prompt(),
+        ephemeral_system_prompt=_voice_system_prompt() + _recent_context(),
         skip_context_files=True,
         load_soul_identity=True,
         quiet_mode=True,
@@ -243,10 +309,16 @@ def _mirror_turn(agent, user_text: str, reply: str) -> None:
         pass
 
 
+def _stamp(prompt: str) -> str:
+    """Prefix the local date/time so time questions never need a tool."""
+    return f"[{time.strftime('%A %Y-%m-%d %H:%M %Z')}] {prompt}"
+
+
 def process_request(request: dict) -> dict:
     prompt = request.get("prompt", "")
     if not prompt:
         return {"error": "empty prompt"}
+    prompt = _stamp(prompt)
     t0 = time.perf_counter()
     use_tools = needs_tools(prompt)
     tier = "full" if use_tools else "fast"
@@ -301,6 +373,11 @@ def main():
             request = json.loads(line)
         except json.JSONDecodeError as e:
             sys.stdout.write(json.dumps({"error": f"invalid JSON: {e}"}) + "\n")
+            sys.stdout.flush()
+            continue
+        if request.get("refresh"):
+            n = _refresh_context()
+            sys.stdout.write(json.dumps({"refreshed": n}) + "\n")
             sys.stdout.flush()
             continue
         response = process_request(request)
