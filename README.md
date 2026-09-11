@@ -36,14 +36,13 @@ iPhone ←FaceTime Audio→ Phone.app/FaceTime.app
 |---|---|
 | `voice_agent.py` | service: call lifecycle, VAD, STT, turns, barge-in, `--simulate` |
 | `hermes_worker.py` | warm Hermes agents, tier routing, filler on tool turns |
-| `tts_helper_ns.py` | system-voice TTS process (Siri); `tts_helper.py` = AVSpeech fallback (cannot do Siri) |
+| `tts_helper_ns.py` | system-voice TTS process (Siri) |
 | `stt_engine.py` | MLX whisper (`DFV_STT_MODEL`, default base.en) |
 | `voice_persona.py` | DATA's voice-call system prompt (no audio deps; the worker imports only this) |
 | `sim_call.py` | play a recorded caller into BlackHole 16ch, record BlackHole 2ch — full pipeline test, **no FaceTime call** |
 | `probe_audio_path.py` | tone test of both daemon audio legs, no call |
 | `audio_procs.swift` | which process holds which CoreAudio device (`swift audio_procs.swift Phone`) |
 | `deploy/` | launchd plists, `dfv-call` (outbound trigger) |
-| `voice_loop.py`, `attach_live.py`, `audio_default.py`, `deploy/ft_enforce_routes.scpt`, `data-facetime-voice-pin` | **legacy, superseded** — kept one release for reference |
 
 ## Running
 

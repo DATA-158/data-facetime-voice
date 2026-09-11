@@ -169,8 +169,8 @@ class TTS:
         self._lock = threading.Lock()
         self._cache: dict[str, np.ndarray] = {}
         # tts_helper_ns.py = NSSpeechSynthesizer = the SYSTEM voice (Siri).
-        # tts_helper.py (AVSpeechSynthesizer) cannot reach Siri voices and
-        # silently renders Samantha — the "robotic woman" of 2026-09-11.
+        # (AVSpeechSynthesizer cannot reach Siri voices at all; it silently
+        # renders Samantha — the "robotic woman" of 2026-09-11. Removed.)
         helper = os.environ.get("DFV_TTS_HELPER", "tts_helper_ns.py")
         self._proc = subprocess.Popen(
             [sys.executable, str(HERE / helper)],

@@ -93,8 +93,7 @@ class _FasterBackend:
 class STT:
     """Picks the fastest available backend and prewarms it.
 
-    Kept API-compatible with the original ``STT`` in voice_loop.py: construct,
-    then call ``transcribe(f32_16k) -> str``.
+    Construct once (prewarms), then call ``transcribe(f32_16k) -> str``.
     """
 
     def __init__(self) -> None:

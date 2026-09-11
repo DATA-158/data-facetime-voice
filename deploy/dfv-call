@@ -1,17 +1,15 @@
 #!/bin/bash
-# dfv-call — place an authorized FaceTime Audio call via the warm voice service.
-# The daemon dials ONLY the authorized E.164 (fail-closed by design).
-# Usage: dfv-call [timeout_seconds]   (default 60)
+# dfv-call — ask the warm voice service to place the authorized FaceTime Audio
+# call. The bridge daemon dials ONLY the configured E.164 (fail-closed).
+# Usage: dfv-call [timeout_seconds]   (default 120: the dial itself, ringing,
+# and answer detection all happen before the result file appears)
 set -u
 DIR="$HOME/.facetime-bridge"
 TRIGGER="$DIR/outbound.trigger"
 RESULT="$DIR/outbound.trigger.result"
-TIMEOUT="${1:-60}"
-# 2026-09-07: pin routes BEFORE dialing (default devices + FaceTime per-app
-# mic/output). FaceTime may not be open yet — the enforcer opens it.
-"$HOME/bin/data-facetime-voice-pin" >/dev/null 2>&1
-rm -f "$RESULT"
+TIMEOUT="${1:-120}"
 mkdir -p "$DIR"
+rm -f "$RESULT"
 touch "$TRIGGER"
 deadline=$(( $(date +%s) + TIMEOUT ))
 while [ "$(date +%s)" -lt "$deadline" ]; do
@@ -21,5 +19,5 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   fi
   sleep 1
 done
-echo "TIMEOUT after ${TIMEOUT}s — check: tail -50 ~/Documents/Programming/Datas_Projects/data-facetime-voice/logs/voice_loop.log"
+echo "TIMEOUT after ${TIMEOUT}s — check: tail -50 ~/Library/Logs/data-facetime-voice/voice_agent.log"
 exit 1

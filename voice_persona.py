@@ -1,14 +1,14 @@
 """DATA's voice-call system context — the ONE source, with zero dependencies.
 
-This lives in its own module on purpose. It used to live in voice_loop.py, and
-hermes_worker.py imported voice_loop just to read the string — which dragged in
+This lives in its own module on purpose. It used to live in the old voice loop, and
+hermes_worker.py imported that whole module just to read the string — which dragged in
 grpc, numpy, soundfile and pyobjc as a side effect. The worker runs under a
 DIFFERENT interpreter (the Hermes venv) than the voice loop (the audio venv),
 and that venv has none of those modules, so the import raised and the worker
 silently fell back to a degraded persona. Verified on this host:
 
     grpc MISSING / numpy MISSING / soundfile MISSING / AppKit MISSING
-    -> voice_loop import FAILED -> degraded fallback persona
+    -> import FAILED -> degraded fallback persona
 
 Nothing about a system prompt needs an audio stack. Import only this.
 """

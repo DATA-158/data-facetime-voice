@@ -6,7 +6,7 @@ skill scan EVERY turn — ~9.5s of pure overhead per turn (measured: 10.5s for a
 3-char reply vs 1.0s raw API). Now the worker holds ONE AIAgent for its whole
 life and calls run_conversation() per turn: system prompt + toolset are
 byte-stable across turns (provider prompt-cache friendly), memories load once,
-and voice_loop.py owns the dialogue history (append-only, passed each turn).
+and voice_agent.py drives it turn by turn over stdin/stdout.
 
 2026-09-07 latency pass #2 — TWO-TIER TOOL POLICY
 -------------------------------------------------
@@ -139,7 +139,7 @@ def _voice_system_prompt() -> str:
         from voice_persona import SYSTEM_CONTEXT
         return SYSTEM_CONTEXT + VOICE_BREVITY_PROMPT
     except Exception:
-        # voice_loop imports grpc/numpy; if this worker's venv lacks them the
+        # voice_persona has no deps, but if the import fails for any reason the
         # import fails. Never let that take the whole worker down silently —
         # a degraded persona beats a call where DATA never speaks.
         return (
