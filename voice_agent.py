@@ -69,6 +69,7 @@ INPUT_GAIN = float(os.environ.get("DFV_INPUT_GAIN", "16"))
 # RINGBACK_GAP_S after at least one burst => answered.
 RINGBACK_RMS = 0.012          # pre-gain
 RINGBACK_GAP_S = float(os.environ.get("DFV_RINGBACK_GAP_S", "4.5"))
+INBOUND_SETTLE_S = float(os.environ.get("DFV_INBOUND_SETTLE_S", "2.5"))
 MAX_SENTENCES = int(os.environ.get("DFV_MAX_SENTENCES", "3"))
 
 GREETING = os.environ.get("DFV_GREETING_LINE", "DATA here. Go ahead, Captain.")
@@ -167,12 +168,17 @@ class TTS:
     def __init__(self):
         self._lock = threading.Lock()
         self._cache: dict[str, np.ndarray] = {}
+        # tts_helper_ns.py = NSSpeechSynthesizer = the SYSTEM voice (Siri).
+        # tts_helper.py (AVSpeechSynthesizer) cannot reach Siri voices and
+        # silently renders Samantha — the "robotic woman" of 2026-09-11.
+        helper = os.environ.get("DFV_TTS_HELPER", "tts_helper_ns.py")
         self._proc = subprocess.Popen(
-            [sys.executable, str(HERE / "tts_helper.py")],
+            [sys.executable, str(HERE / helper)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
         status = json.loads(self._proc.stdout.readline().decode())
         if status.get("status") != "ready":
             raise RuntimeError(f"tts helper: {status}")
+        log.info("TTS helper %s ready: %s", helper, status)
 
     def render(self, text: str) -> np.ndarray:
         """int16 mono at BRIDGE_RATE."""
@@ -267,7 +273,7 @@ def looks_hallucinated(text: str, audio_s: float) -> bool:
 
 
 class SentenceBuffer:
-    def __init__(self, first_clause_chars: int = 60):
+    def __init__(self, first_clause_chars: int = 40):
         self.buf = ""
         self.emitted = 0
         self.first_clause_chars = first_clause_chars
@@ -808,6 +814,11 @@ def run_call(bridge, vad, tts, stt, worker, outbound: bool, simulate: bool = Fal
             log.error("outbound call not answered (%s) — not opening audio", how)
             return
         log.info("answered (%s) — opening audio stream", how)
+    elif not simulate:
+        # Inbound: the daemon pressed Answer and confirmed 'connected'. Give
+        # Phone.app a moment to open its devices before ours start (the audio
+        # law: our engines must start AFTER Phone holds BlackHole 2ch).
+        time.sleep(INBOUND_SETTLE_S)
     call_id = f"dfv-{int(time.time())}"
     audio = AudioSession(bridge, call_id)
     if not audio.ready.wait(30):
@@ -832,9 +843,14 @@ def wait_incoming(bridge: Bridge, events: queue.Queue, stop: threading.Event):
             for ev in bridge.stub.WaitIncoming(pb.WaitIncomingRequest()):
                 log.info("incoming event: state=%s authorized=%s err=%s", ev.state, ev.authorized, ev.error_code)
                 if ev.state == "connected":
+                    # Only reachable after the daemon's own identity-verified
+                    # Answer press: the ringing card carried the configured
+                    # E.164 or contact name. Anyone else rings out.
                     events.put("inbound")
                     break
                 if ev.error_code:
+                    if ev.error_code == "CALLER_NOT_AUTHORIZED":
+                        log.warning("incoming call from an unauthorized caller — not answering")
                     break
         except grpc.RpcError as e:
             log.warning("WaitIncoming: %s %s", e.code(), e.details())
