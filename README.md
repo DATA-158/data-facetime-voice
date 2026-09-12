@@ -5,8 +5,9 @@ places and answers FaceTime Audio calls with the Captain, hears him via local
 Whisper, thinks with a warm Hermes worker, and speaks with the Mac's own
 system voice (Siri). Everything is local except the LLM call.
 
-First fully working two-way call: 2026-09-11 15:58 on DATA's Mac — greeting
-~5 s after pickup, turns 1.0–1.3 s.
+Verified live on DATA's Mac: outbound 2026-09-11 (greeting ~5 s after
+pickup, turns 1–2 s) and inbound 2026-09-12 (answered 69 ms after the ring,
+audio open 130 ms later, cross-channel context recalled on the first turn).
 
 ## Architecture
 
@@ -84,11 +85,13 @@ Anyone else rings out.
    2–6 s. Per-app: FaceTime.app and Phone.app Video menu → mic BlackHole 2ch,
    output BlackHole 16ch (already set; honored).
 5. **The Click-to-Call card on macOS 26.6 shows the contact NAME, not the
-   number.** The daemon (`facetime-bridge-ax4`) authorizes it via
+   number.** The daemon (`~/.local/bin/facetime-bridge-daemon`) authorizes it via
    `FACETIME_BRIDGE_AUTHORIZED_CALLER_NAME` (`promptNameIdentity`, same trust
-   model as the incoming-ring patch). Each new daemon binary needs its own
-   Accessibility grant, and a plist change needs `launchctl bootout` +
-   `bootstrap` — `kickstart -k` re-runs the old program.
+   model as the incoming-ring patch). The daemon is signed with the
+   self-signed "DATA FaceTime Bridge" identity so its Accessibility and
+   Microphone grants survive rebuilds (`deploy/install-daemon.sh`); an ad-hoc
+   binary needs a new grant per build. A plist program change needs
+   `launchctl bootout` + `bootstrap` — `kickstart -k` re-runs the old program.
 6. **The system voice is a Siri voice** (`com.apple.siri.natural.Aaron`).
    AVSpeechSynthesizer cannot load Siri voices at all — it silently renders
    Samantha. NSSpeechSynthesizer with voice=nil renders the system voice,
@@ -103,13 +106,28 @@ Anyone else rings out.
    (EX_CONFIG, no log). Service logs go to `~/Library/Logs/data-facetime-voice/`.
 10. glm-5.3-flash via ollama-cloud with reasoning `none` leaks its thinking
     as untagged content — DATA speaks it. `low` is separated cleanly.
+11. **Incoming-call banners are suppressed while the display is shared**
+    (RustDesk counts) unless Notifications → "when mirroring or sharing the
+    display" = Allow Notifications. The call still lands in Recents as missed;
+    nothing is drawn for the daemon to press. Four silent inbound tests.
+12. **A new daemon binary's first audio open waits on the macOS Microphone
+    prompt** (measured 113,844 ms). Cached per signed identity afterwards
+    (130 ms); the voice service also opens/closes one stream at startup.
+13. **An unauthorized "connected" Phone.app surface must not outrank an
+    authorized ring.** A Phone window left over from a previous call exposes
+    its "communication audio" button during the next ring; the daemon now
+    prefers the identity-verified ring. Don't leave Phone.app open anyway.
+14. Long tool turns can outlast the call (36 s search while the Captain hung
+    up at 22 s). Open item: progress updates past ~10 s and text the result
+    if the call ends first.
 
-## Latency (live call 2026-09-11 15:58, Siri voice not yet in)
+## Latency (live, Siri voice)
 
-utterance end → first audio: **1.0–1.3 s** (STT 130–210 ms, LLM ~0.8 s,
-TTS ~100 ms). With the Siri voice, TTS is 0.3–0.9 s per sentence
-(simulator: first audio ~2.0 s). Pickup → greeting: ~5 s. A stall filler
-("One moment, Captain.") covers provider hiccups past 3.5 s.
+Conversational turns: **1.0–2.0 s** utterance end → first audio (STT
+130–540 ms, LLM ~1 s, TTS 0.3–0.9 s/sentence). Tool turns: filler at once,
+answer 7–36 s later. Outbound pickup → greeting ~5 s; inbound ring → answer
+69 ms, → greeting ~3 s. A stall filler ("One moment, Captain.") covers
+provider hiccups past 3.5 s.
 
 ## Secrets
 
