@@ -189,14 +189,23 @@ def _recent_context() -> str:
         return ""
     try:
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
-        rows = con.execute(
-            "SELECT s.source, m.role, m.timestamp, m.content FROM messages m "
-            "JOIN sessions s ON s.id = m.session_id "
-            "WHERE m.timestamp > ? AND m.role IN ('user','assistant') "
-            "AND s.source NOT IN (%s) ORDER BY m.timestamp DESC LIMIT ?"
+        since = time.time() - RECENT_HOURS * 3600
+        # Sessions first (small table), then messages by session id (indexed):
+        # the naive join scanned the whole messages table — 5-7 s on this host.
+        sessions = con.execute(
+            "SELECT id, source FROM sessions WHERE source NOT IN (%s) "
+            "AND started_at > ? ORDER BY started_at DESC LIMIT 20"
             % ",".join("?" * len(_EXCLUDED_SOURCES)),
-            (time.time() - RECENT_HOURS * 3600, *_EXCLUDED_SOURCES, RECENT_MAX_MSGS),
+            (*_EXCLUDED_SOURCES, since - 7 * 86400),
         ).fetchall()
+        rows = []
+        for sid, source in sessions:
+            rows += [(source, r, ts, c) for r, ts, c in con.execute(
+                "SELECT role, timestamp, content FROM messages WHERE session_id = ? "
+                "AND timestamp > ? AND role IN ('user','assistant') ORDER BY timestamp DESC LIMIT ?",
+                (sid, since, RECENT_MAX_MSGS)).fetchall()]
+        rows.sort(key=lambda r: r[2], reverse=True)
+        rows = rows[:RECENT_MAX_MSGS]
         con.close()
     except Exception as e:
         sys.stderr.write(f"recent-context read failed: {e}\n")

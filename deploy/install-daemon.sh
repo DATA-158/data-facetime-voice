@@ -23,6 +23,8 @@ cp "$BIN" "$DEST.tmp" && mv "$DEST.tmp" "$DEST"
 codesign -dvv "$DEST" 2>&1 | grep -E "Authority|Identifier" | head -2
 if launchctl print "gui/$(id -u)/ai.data.facetime-bridge" 2>/dev/null | grep -q "$DEST"; then
   launchctl kickstart -k "gui/$(id -u)/ai.data.facetime-bridge" && echo "daemon restarted"
+  # The voice service warms the daemon's audio path at startup; restart it too.
+  sleep 3; launchctl kickstart -k "gui/$(id -u)/ai.data.facetime-voice" && echo "voice service restarted"
 else
   echo "NOTE: launchd job does not point at $DEST yet — edit the plist, then bootout + bootstrap (kickstart -k re-runs the OLD program)."
 fi

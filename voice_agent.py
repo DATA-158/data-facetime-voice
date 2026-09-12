@@ -814,9 +814,14 @@ def run_call(bridge, vad, tts, stt, worker, outbound: bool, simulate: bool = Fal
         # Phone.app a moment to open its devices before ours start (the audio
         # law: our engines must start AFTER Phone holds BlackHole 2ch).
         time.sleep(INBOUND_SETTLE_S)
-    t = time.perf_counter()
-    n = worker.refresh()
-    log.info("worker context refreshed: %d recent lines (%.0fms)", n, (time.perf_counter() - t) * 1000)
+    # Context refresh off the critical path: the state.db read took 7.3 s on
+    # the 20:36 inbound call and delayed the audio open. The worker lock
+    # serializes it against the first turn, so the prompt is fresh by then.
+    def _refresh():
+        t = time.perf_counter()
+        n = worker.refresh()
+        log.info("worker context refreshed: %d recent lines (%.0fms)", n, (time.perf_counter() - t) * 1000)
+    threading.Thread(target=_refresh, daemon=True, name="ctx-refresh").start()
     call_id = f"dfv-{int(time.time())}"
     audio = AudioSession(bridge, call_id)
     if not audio.ready.wait(30):
@@ -832,6 +837,21 @@ def run_call(bridge, vad, tts, stt, worker, outbound: bool, simulate: bool = Fal
             "BH2 tap during greeting: rms=%.4f (%s)", rms, "playback leg LIVE" if rms > 0.01 else "playback leg DEAD")
     call.run()
     log.info("call finished: %d transcript turns", len(call.transcript))
+
+
+def warm_daemon_audio(bridge: Bridge):
+    """The daemon's FIRST Audio stream after it starts is slow (5 s at 16:44,
+    >30 s on the 20:36 inbound call — the Captain hung up before 'ready').
+    Open and close one stream now, while idle, so a call never pays it."""
+    t = time.perf_counter()
+    try:
+        s = AudioSession(bridge, f"warm-{int(time.time())}")
+        ok = s.ready.wait(60)
+        s.stop()
+        s.closed.wait(5)
+        log.info("daemon audio path warmed: ready=%s in %.1fs", ok, time.perf_counter() - t)
+    except Exception as e:
+        log.warning("daemon audio warm-up failed: %s", e)
 
 
 def wait_incoming(bridge: Bridge, events: queue.Queue, stop: threading.Event):
@@ -873,6 +893,7 @@ def main():
     tts.preload(GREETING, TOOL_FILLER, LOST_LINE, CAP_LINE, STALL_LINE)
     stt = stt_engine.STT()
     worker = Worker()
+    warm_daemon_audio(bridge)
     log.info("all warm in %.1fs — waiting for a call", time.perf_counter() - t)
 
     if "--simulate" in sys.argv:
