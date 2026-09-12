@@ -8,15 +8,20 @@
 		     Without it outbound dialing refuses to run. -->
 		<key>FACETIME_BRIDGE_AUTHORIZED_CALLER_E164</key>
 		<string>+15550000000</string>
-		<!-- Reasoning effort for TOOL turns. Conversational turns run with
-		     reasoning off (DFV_REASONING_EFFORT_FAST, default "none") because
-		     thinking tokens are emitted before content and are dead air on a
-		     call. -->
+		<!-- Reasoning effort for TOOL turns (medium: the filler covers the
+		     thinking). Conversational turns stay at "low"
+		     (DFV_REASONING_EFFORT_FAST): thinking tokens precede the answer
+		     and are dead air on a call; "none" makes glm-5.3-flash leak its
+		     reasoning into speech. Thinking sound: DFV_THINKING_SOUND=hum|off,
+		     DFV_THINK_HUM_S / DFV_THINK_GAP_S / DFV_THINK_GAIN. -->
 		<key>DFV_REASONING_EFFORT</key>
 		<string>medium</string>
 		<key>DFV_SILENCE_MS</key>
 		<string>700</string>
 		<key>GRPC_ENABLE_FORK_SUPPORT</key>
+		<string>1</string>
+		<!-- launchd log lines land as they happen. -->
+		<key>PYTHONUNBUFFERED</key>
 		<string>1</string>
 	</dict>
 	<key>KeepAlive</key>
