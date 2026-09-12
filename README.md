@@ -99,9 +99,18 @@ Anyone else rings out.
    same voice plus 0.6 s of init per call.
 7. Caller audio off BlackHole 16ch is −42 dBFS. 24 dB gain + limiter before
    VAD/STT. Whisper loops ("I'm sorry" ×30) on ~1 s of noise → dropped.
-8. **This is an 8 GB MacBook Air.** With Docker Desktop, Brave and the Hermes
-   Electron app running it sat at load avg 20 and 3.7 GB swap; `say` took
-   8 s, warm-up 35 s. Quit them. Nothing measured elsewhere transfers here.
+8. **This is an 8 GB MacBook Air; memory is the budget.** A call turn needs
+   ~1.5 GB resident (agent + Hermes worker + whisper + the Siri renderer
+   `SiriAUSP`) and ~2 free cores for the burst. Measured 2026-09-12: with
+   Docker's default VM (8 CPU / 4.1 GB) + Firecrawl (1.7 GB resident) + Brave
+   + Hermes desktop, TTS was 3–6 s/sentence and first audio 6–11 s. Now:
+   Docker VM 2 CPU / 1 GB (`~/Library/Group Containers/group.com.docker/
+   settings-store.json`), Firecrawl stopped (`extract_backend: local` —
+   `deploy/hermes-plugins/web-local`, in-process httpx + stdlib parser, no
+   service), Hermes desktop app closed (the gateway is DATA; the app is UI).
+   Result: TTS 0.5–1.0 s/sentence, STT 0.2 s, no stalls. `buzz` containers
+   (MinIO/Postgres/Redis, 20 MB) stay. Firecrawl's data is intact:
+   `cd ~/.hermes/services/firecrawl-src && docker compose start` brings it back.
 9. launchd on macOS 26 cannot open a job's stdout under `~/Documents`
    (EX_CONFIG, no log). Service logs go to `~/Library/Logs/data-facetime-voice/`.
 10. glm-5.3-flash via ollama-cloud with reasoning `none` leaks its thinking
