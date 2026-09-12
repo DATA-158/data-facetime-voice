@@ -78,6 +78,15 @@ LOST_LINE = os.environ.get("DFV_TURN_FAILED_LINE", "Captain, I lost that one. Sa
 CAP_LINE = os.environ.get("DFV_VOICE_CAP_CLOSING_LINE", "Full details on iMessage, Captain.")
 STALL_LINE = os.environ.get("DFV_STALL_LINE", "One moment, Captain.")
 STALL_AFTER_S = float(os.environ.get("DFV_STALL_AFTER_S", "3.5"))
+# "Thinking" sound: a soft blip every THINK_PERIOD_S while a turn has produced
+# no speech yet (the LLM's first token is the one latency we can't shorten).
+# Pushed in 100 ms slices just-in-time so at most ~150 ms is ever queued, and
+# flushed with CLEAR the instant the first sentence is ready — it never delays
+# DATA. Pauses under the filler/stall line; stops on speech or barge-in.
+THINKING_SOUND = os.environ.get("DFV_THINKING_SOUND", "blip").lower()   # blip | off
+THINK_AFTER_S = float(os.environ.get("DFV_THINK_AFTER_S", "1.0"))
+THINK_PERIOD_S = float(os.environ.get("DFV_THINK_PERIOD_S", "0.6"))
+THINK_GAIN = float(os.environ.get("DFV_THINK_GAIN", "0.07"))             # ~-23 dBFS
 
 log = logging.getLogger("dfv")
 
@@ -321,6 +330,18 @@ class Bridge:
             return None
 
 
+def thinking_pattern() -> np.ndarray:
+    """One period of the thinking sound: a 40 ms 520 Hz blip with a raised-
+    cosine envelope, then silence to THINK_PERIOD_S. int16 at BRIDGE_RATE."""
+    n = int(THINK_PERIOD_S * BRIDGE_RATE)
+    out = np.zeros(n, dtype=np.float32)
+    blip = int(0.040 * BRIDGE_RATE)
+    t = np.arange(blip) / BRIDGE_RATE
+    env = 0.5 - 0.5 * np.cos(2 * np.pi * np.arange(blip) / blip)
+    out[:blip] = THINK_GAIN * env * np.sin(2 * np.pi * 520 * t)
+    return (out * 32767).astype(np.int16)
+
+
 class AudioSession:
     """One bidi Audio stream: START first, CAPTURE in, PLAYBACK/CLEAR/STOP out."""
 
@@ -373,6 +394,11 @@ class AudioSession:
         step = 2400 * 2  # 100 ms per packet
         for i in range(0, len(b), step):
             self.outq.put(self._pkt(pb.AUDIO_PACKET_KIND_PLAYBACK, b[i:i + step]))
+
+    def play_raw(self, pcm: np.ndarray):
+        """Queue audio WITHOUT counting it as speech (thinking blips): VAD
+        thresholds and the 'playing' pause logic ignore it."""
+        self.outq.put(self._pkt(pb.AUDIO_PACKET_KIND_PLAYBACK, pcm.tobytes()))
 
     @property
     def playing(self) -> bool:
@@ -568,7 +594,29 @@ class Call:
         t0 = time.perf_counter()
         first_audio = [None]
 
-        def speak(s: str) -> bool:
+        thinking_stop = threading.Event()
+
+        def thinking():
+            # Soft blips while the turn has produced no speech. Just-in-time
+            # pacing keeps the daemon queue shallow so the flush is instant.
+            if thinking_stop.wait(THINK_AFTER_S):
+                return
+            pattern = thinking_pattern()
+            step = int(0.1 * BRIDGE_RATE)
+            pos = 0
+            while not thinking_stop.is_set() and not self.barge.is_set():
+                if self.audio.playing:          # filler / stall line on air
+                    time.sleep(0.1)
+                    continue
+                chunk = pattern[pos:pos + step]
+                pos = (pos + step) % len(pattern)
+                self.audio.play_raw(chunk)
+                time.sleep(0.095)
+
+        if THINKING_SOUND == "blip":
+            threading.Thread(target=thinking, daemon=True, name="thinking").start()
+
+        def speak(s: str, filler: bool = False) -> bool:
             nonlocal spoken
             if self.barge.is_set() or spoken >= MAX_SENTENCES:
                 return False
@@ -576,6 +624,12 @@ class Call:
             pcm = self.tts.render(s)
             if self.barge.is_set():
                 return False
+            if not filler and not thinking_stop.is_set():
+                # First real sentence: end the blips and flush whatever slice is
+                # still queued so DATA's voice starts now, not 100 ms later.
+                thinking_stop.set()
+                if THINKING_SOUND == "blip":
+                    self.audio.clear()
             self.audio.play(pcm)
             spoken += 1
             if first_audio[0] is None:
@@ -600,7 +654,7 @@ class Call:
         stall_timer.start()
         tier = "?"
         try:
-            final, tier = self.worker.stream(user_text, on_delta, lambda f: speak(f),
+            final, tier = self.worker.stream(user_text, on_delta, lambda f: speak(f, filler=True),
                                              lambda: self.barge.is_set() or spoken >= MAX_SENTENCES)
             for s in sentences.flush():
                 speak(s)
@@ -621,6 +675,7 @@ class Call:
                 self.say(LOST_LINE)
         finally:
             stall_timer.cancel()
+            thinking_stop.set()
 
     # ---- lifecycle --------------------------------------------------------
     def watch_end(self):
