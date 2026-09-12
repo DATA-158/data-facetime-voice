@@ -78,8 +78,12 @@ TOOL_TOOLSETS = ["file", "web", "search", "terminal", "session_search", "memory"
 # untagged CONTENT — DATA would speak his thoughts aloud. "low" is separated
 # cleanly by the provider. Measured on DATA's host; see voice_agent.py.
 FAST_REASONING_EFFORT = os.environ.get("DFV_REASONING_EFFORT_FAST", "low")
+# 2026-09-12, Captain's call: tool turns think at MEDIUM (the filler covers
+# the extra seconds; multi-step tasks — find/price/remind, calendar/text —
+# benefit). Conversation stays LOW: measured on the same prompts, medium
+# added 2-6 s of silence before the first word for identical answers.
 FULL_REASONING_EFFORT = os.environ.get(
-    "DFV_REASONING_EFFORT", os.environ.get("DFV_REASONING_EFFORT_FULL", "low"))
+    "DFV_REASONING_EFFORT", os.environ.get("DFV_REASONING_EFFORT_FULL", "medium"))
 
 # Spoken the instant a turn routes to the tool-enabled agent, so the caller
 # hears acknowledgement rather than dead air while the tool loop runs.
@@ -96,7 +100,12 @@ _ACTION_PATTERNS = re.compile(
     r"github|repo|issue|pull request|pr\b|commit|deploy|build|"
     r"file|execute|terminal|command|script|"
     r"remember|recall|memory|last time|we talked|you said|"
-    r"news|price|stock|score|time in"
+    r"news|price|prices|pricing|stock|score|time in|"
+    # 2026-09-12: the Captain's typical call tasks — shop for something and
+    # remind him with a link; read the calendar and text someone a window.
+    r"buy|purchase|order|cheapest|cheaper|option|options|find me|look into|"
+    r"let (?:him|her|them|\w+) know|tell \w+ (?:that|when|i)|"
+    r"available|availability|free (?:time|slot|window)|when (?:i'?m|am i) free"
     r")\b",
     re.IGNORECASE,
 )
