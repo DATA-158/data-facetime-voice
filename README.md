@@ -72,7 +72,7 @@ short line per tool call at most every `DFV_PROGRESS_EVERY_S` (8 s —
 "Searching for X.", "Reading a page.", "Writing that down."), a keep-alive
 after `DFV_KEEPALIVE_S` (20 s) of silence, and the hum in between — it
 resumes after every line once DATA has been quiet for `DFV_THINK_AFTER_S`,
-and stops for good once the answer is out. Narration and progress never
+and stops for good once the answer is out. The swell is dB-linear (`DFV_THINK_FADE_DB`, 30) so the far end hears the whole fade — an amplitude-cosine tail sat under FaceTime's gate and sounded chopped — and 300 ms is kept queued (`DFV_THINK_LEAD_S`) against scheduling dropouts. Narration and progress never
 count against the 3-sentence answer cap.
 
 **A task given on a call is finished after the hang-up.** The Captain's

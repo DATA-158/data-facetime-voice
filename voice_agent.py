@@ -91,6 +91,17 @@ THINK_AFTER_S = float(os.environ.get("DFV_THINK_AFTER_S", "1.0"))
 THINK_HUM_S = float(os.environ.get("DFV_THINK_HUM_S", "3.0"))
 THINK_GAP_S = float(os.environ.get("DFV_THINK_GAP_S", "2.5"))
 THINK_GAIN = float(os.environ.get("DFV_THINK_GAIN", "0.045"))           # ~-27 dBFS peak
+# 2026-09-13, Captain: "the end of the hum gets chopped off abruptly rather
+# than fading out the way it fades in." Two causes, both fixed here. (1) The
+# swell was a raised cosine in AMPLITUDE: its last ~0.6 s sits below -20 dB
+# re peak, where FaceTime's voice processing gates a steady tone — the far
+# end hears a cut. The envelope is now linear in dB (even in loudness) from
+# THINK_FADE_DB below peak up to peak and back, so the fade is audible right
+# to the end. (2) Slices were paced with no headroom (100 ms of audio every
+# 95 ms, starting from an empty queue): any scheduling hiccup on a loaded
+# machine was a dropout. The hum now keeps THINK_LEAD_S queued.
+THINK_FADE_DB = float(os.environ.get("DFV_THINK_FADE_DB", "30"))
+THINK_LEAD_S = float(os.environ.get("DFV_THINK_LEAD_S", "0.3"))
 # Progress on long tool turns (2026-09-13; live call 10:40: a 146 s turn, the
 # Captain hung up at 22 s having heard only the filler and the hum). The
 # worker reports each tool call; we speak one line at most every
@@ -390,12 +401,15 @@ class Bridge:
 
 
 def thinking_pattern() -> np.ndarray:
-    """One cycle of the thinking sound: a THINK_HUM_S raised-cosine swell of a
-    C3-G3-C4 chord, then THINK_GAP_S of silence. int16 at BRIDGE_RATE."""
+    """One cycle of the thinking sound: a THINK_HUM_S swell of a C3-G3-C4 chord
+    (dB-linear fade in and out, THINK_FADE_DB deep), then THINK_GAP_S of
+    silence. int16 at BRIDGE_RATE."""
     n = int(THINK_HUM_S * BRIDGE_RATE)
     t = np.arange(n) / BRIDGE_RATE
     chord = sum(np.sin(2 * np.pi * f * t) for f in (130.8, 196.0, 261.6)) / 3
-    env = 0.5 - 0.5 * np.cos(2 * np.pi * np.arange(n) / n)
+    tri = 1.0 - np.abs(np.linspace(-1.0, 1.0, n))           # 0 → 1 → 0, linear
+    env = 10 ** (-THINK_FADE_DB * (1.0 - tri) / 20)          # -FADE dB → 0 dB → -FADE dB
+    env = (env - env.min()) / (1.0 - env.min())              # touch true zero at the ends
     hum = THINK_GAIN * env * chord
     gap = np.zeros(int(THINK_GAP_S * BRIDGE_RATE), dtype=np.float32)
     return (np.concatenate([hum, gap]) * 32767).astype(np.int16)
@@ -711,23 +725,31 @@ class Call:
             pattern = thinking_pattern()
             step = int(0.1 * BRIDGE_RATE)
             pos = 0
+            queued_until = 0.0              # wall time the queued hum plays out to
             quiet_since = time.perf_counter()
             while not turn_over.is_set() and not self.barge.is_set() and not self.ended.is_set():
                 if spoken >= MAX_SENTENCES:     # the answer is out; nothing to wait for
                     return
+                now = time.perf_counter()
                 if self.audio.playing:          # speech on air
-                    quiet_since = time.perf_counter()
+                    quiet_since = now
                     pos = 0
+                    queued_until = 0.0
                     time.sleep(0.1)
                     continue
-                if time.perf_counter() - quiet_since < THINK_AFTER_S:
+                if now - quiet_since < THINK_AFTER_S:
                     time.sleep(0.05)
                     continue
-                chunk = pattern[pos:pos + step]
-                pos = (pos + step) % len(pattern)
-                self.audio.play_raw(chunk)
-                hum_last[0] = time.perf_counter()
-                time.sleep(0.095)
+                # Keep THINK_LEAD_S of hum queued ahead of the play head; the
+                # flush in speak() makes the depth inaudible when DATA speaks.
+                queued_until = max(queued_until, now)
+                while queued_until - now < THINK_LEAD_S:
+                    chunk = pattern[pos:pos + step]
+                    pos = (pos + step) % len(pattern)
+                    self.audio.play_raw(chunk)
+                    queued_until += len(chunk) / BRIDGE_RATE
+                hum_last[0] = now
+                time.sleep(0.05)
 
         if THINKING_SOUND == "hum":
             threading.Thread(target=thinking, daemon=True, name="thinking").start()
@@ -740,10 +762,10 @@ class Call:
             pcm = self.tts.render(s)
             if self.barge.is_set() or self.ended.is_set():
                 return False
-            if time.perf_counter() - hum_last[0] < 0.3:
-                # The hum is on air: flush the queued slice so DATA's voice
-                # starts now, not 100 ms later. (Only hum can be queued here —
-                # it never plays over speech.)
+            if time.perf_counter() - hum_last[0] < THINK_LEAD_S + 0.2:
+                # The hum is on air: flush what is queued so DATA's voice
+                # starts now. (Only hum can be queued here — it never plays
+                # over speech.)
                 self.audio.clear()
             self.audio.play(pcm)
             if not filler:              # fillers/progress are not the answer
