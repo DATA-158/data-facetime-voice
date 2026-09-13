@@ -16,7 +16,7 @@
 		     DFV_THINK_HUM_S / DFV_THINK_GAP_S / DFV_THINK_GAIN.
 		     Long tool turns: DFV_PROGRESS_EVERY_S (8), DFV_KEEPALIVE_S (20).
 		     After a hang-up the turn completes and the result is texted via
-		     `hermes send --to imessage`: DFV_FOLLOWUP=on|off, DFV_FOLLOWUP_TARGET,
+		     hermes send (imessage): DFV_FOLLOWUP=on|off, DFV_FOLLOWUP_TARGET,
 		     HERMES_CLI (~/.hermes/hermes-agent/venv/bin/hermes). -->
 		<key>DFV_REASONING_EFFORT</key>
 		<string>medium</string>
