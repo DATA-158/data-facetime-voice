@@ -698,23 +698,35 @@ class Call:
             # A previous call's follow-through still holds the worker.
             self.say(BUSY_LINE)
 
-        thinking_stop = threading.Event()
+        turn_over = threading.Event()
+        hum_last = [0.0]            # when the last hum slice was queued
 
         def thinking():
-            # Thinking hum while the turn has produced no speech. Just-in-time
-            # pacing keeps the daemon queue shallow so the flush is instant.
-            if thinking_stop.wait(THINK_AFTER_S):
-                return
+            # Thinking hum whenever DATA has been silent for THINK_AFTER_S
+            # mid-turn: before the first word, and again after each filler,
+            # progress line or piece of narration until the next one (Captain,
+            # 2026-09-13: "it should start back up after the progress line").
+            # Just-in-time pacing keeps the daemon queue shallow so the flush
+            # in speak() is instant. Each resume restarts the swell from silence.
             pattern = thinking_pattern()
             step = int(0.1 * BRIDGE_RATE)
             pos = 0
-            while not thinking_stop.is_set() and not self.barge.is_set() and not self.ended.is_set():
-                if self.audio.playing:          # filler / stall line on air
+            quiet_since = time.perf_counter()
+            while not turn_over.is_set() and not self.barge.is_set() and not self.ended.is_set():
+                if spoken >= MAX_SENTENCES:     # the answer is out; nothing to wait for
+                    return
+                if self.audio.playing:          # speech on air
+                    quiet_since = time.perf_counter()
+                    pos = 0
                     time.sleep(0.1)
+                    continue
+                if time.perf_counter() - quiet_since < THINK_AFTER_S:
+                    time.sleep(0.05)
                     continue
                 chunk = pattern[pos:pos + step]
                 pos = (pos + step) % len(pattern)
                 self.audio.play_raw(chunk)
+                hum_last[0] = time.perf_counter()
                 time.sleep(0.095)
 
         if THINKING_SOUND == "hum":
@@ -728,12 +740,11 @@ class Call:
             pcm = self.tts.render(s)
             if self.barge.is_set() or self.ended.is_set():
                 return False
-            if not filler and not thinking_stop.is_set():
-                # First real sentence: end the hum and flush whatever slice is
-                # still queued so DATA's voice starts now, not 100 ms later.
-                thinking_stop.set()
-                if THINKING_SOUND == "hum":
-                    self.audio.clear()
+            if time.perf_counter() - hum_last[0] < 0.3:
+                # The hum is on air: flush the queued slice so DATA's voice
+                # starts now, not 100 ms later. (Only hum can be queued here —
+                # it never plays over speech.)
+                self.audio.clear()
             self.audio.play(pcm)
             if not filler:              # fillers/progress are not the answer
                 spoken += 1
@@ -768,7 +779,6 @@ class Call:
                 if (not self.audio.playing and not self.barge.is_set()
                         and time.perf_counter() - last_speech[0] >= KEEPALIVE_S):
                     speak(KEEPALIVE_LINE, filler=True)
-        turn_over = threading.Event()
         threading.Thread(target=keepalive, daemon=True, name="keepalive").start()
 
         def stall():
@@ -809,7 +819,6 @@ class Call:
                 self.say(LOST_LINE)
         finally:
             stall_timer.cancel()
-            thinking_stop.set()
             turn_over.set()
 
     # ---- after the hang-up -------------------------------------------------

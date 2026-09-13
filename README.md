@@ -70,8 +70,10 @@ Tool turns run 7–150 s. While one runs the Captain hears: the filler at once
 ("Let me check that, Captain."), DATA's own narration as it streams, one
 short line per tool call at most every `DFV_PROGRESS_EVERY_S` (8 s —
 "Searching for X.", "Reading a page.", "Writing that down."), a keep-alive
-after `DFV_KEEPALIVE_S` (20 s) of silence, and the hum in between. Narration
-and progress never count against the 3-sentence answer cap.
+after `DFV_KEEPALIVE_S` (20 s) of silence, and the hum in between — it
+resumes after every line once DATA has been quiet for `DFV_THINK_AFTER_S`,
+and stops for good once the answer is out. Narration and progress never
+count against the 3-sentence answer cap.
 
 **A task given on a call is finished after the hang-up.** The Captain's
 standing order (2026-09-13): "if I say 'do this thing' and then hang up, DATA
