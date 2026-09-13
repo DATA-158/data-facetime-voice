@@ -36,7 +36,7 @@ iPhone ←FaceTime Audio→ Phone.app/FaceTime.app
 | file | role |
 |---|---|
 | `voice_agent.py` | service: call lifecycle, VAD, STT, turns, barge-in, `--simulate` |
-| `hermes_worker.py` | warm Hermes agents, tier routing, filler on tool turns |
+| `hermes_worker.py` | warm Hermes agents, tier routing, filler + per-tool progress, post-call follow-up |
 | `tts_helper_ns.py` | system-voice TTS process (Siri) |
 | `stt_engine.py` | MLX whisper (`DFV_STT_MODEL`, default base.en) |
 | `voice_persona.py` | DATA's voice-call system prompt (no audio deps; the worker imports only this) |
@@ -63,6 +63,32 @@ python sim_call.py recordings/<call>/caller.wav --seconds 60
 Inbound: the daemon's `WaitIncoming` answers a ringing call only when the
 card carries the configured caller; `voice_agent` then opens audio and talks.
 Anyone else rings out.
+
+### Long tool turns and hang-ups
+
+Tool turns run 7–150 s. While one runs the Captain hears: the filler at once
+("Let me check that, Captain."), DATA's own narration as it streams, one
+short line per tool call at most every `DFV_PROGRESS_EVERY_S` (8 s —
+"Searching for X.", "Reading a page.", "Writing that down."), a keep-alive
+after `DFV_KEEPALIVE_S` (20 s) of silence, and the hum in between. Narration
+and progress never count against the 3-sentence answer cap.
+
+**A task given on a call is finished after the hang-up.** The Captain's
+standing order (2026-09-13): "if I say 'do this thing' and then hang up, DATA
+should proceed to do that thing completely, finish it, and then iMessage me
+when it is finished." So when the call ends mid-turn (or with his last
+sentence still in the queue) the loop stops speaking but lets the turn run to
+completion, then asks the FULL agent — voice rules lifted — to finish anything
+undone and write the report, and sends it with `hermes send --to imessage`
+(the gateway's own standalone delivery; home channel from Hermes config, no
+addresses here). A conversation-tier answer that arrived after the hang-up is
+texted only if it is substantive (`DFV_FOLLOWUP_MIN_FAST_CHARS`). Barged-in
+turns are not followed through. Undeliverable reports stay in
+`logs/undelivered/`. `DFV_FOLLOWUP=off` disables all of it.
+
+While a follow-through is still running, a new call's first turn says
+"Still finishing your last request, Captain. One moment." and waits — one
+worker, one 8 GB machine.
 
 ## The audio laws (measured live, 2026-09-11 — read before touching)
 
@@ -126,17 +152,20 @@ Anyone else rings out.
     authorized ring.** A Phone window left over from a previous call exposes
     its "communication audio" button during the next ring; the daemon now
     prefers the identity-verified ring. Don't leave Phone.app open anyway.
-14. Long tool turns can outlast the call (36 s search while the Captain hung
-    up at 22 s). Open item: progress updates past ~10 s and text the result
-    if the call ends first.
+14. **Long tool turns outlast the call** (36 s search, hang-up at 22 s; 146 s
+    research turn on 2026-09-13, hang-up at 22 s — the answer was spoken to a
+    dead line). Resolved: per-tool progress lines + keep-alive during the
+    turn, and after a hang-up the turn completes and the result is texted
+    (see "Long tool turns and hang-ups").
 
 ## Latency (live, Siri voice)
 
 Conversational turns: **1.0–2.0 s** utterance end → first audio (STT
 130–540 ms, LLM ~1 s, TTS 0.3–0.9 s/sentence). Tool turns: filler at once,
-answer 7–36 s later. Outbound pickup → greeting ~5 s; inbound ring → answer
-69 ms, → greeting ~3 s. A stall filler ("One moment, Captain.") covers
-provider hiccups past 3.5 s.
+answer 7–150 s later with progress lines in between. Outbound pickup →
+greeting ~5 s; inbound ring → answer 69 ms, → greeting ~3 s. A stall filler
+("One moment, Captain.") covers provider hiccups past 3.5 s. Post-hang-up
+follow-through: one more FULL turn (medium reasoning) + `hermes send` ≈ 5 s.
 
 ## Secrets
 

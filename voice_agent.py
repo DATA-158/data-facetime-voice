@@ -91,6 +91,33 @@ THINK_AFTER_S = float(os.environ.get("DFV_THINK_AFTER_S", "1.0"))
 THINK_HUM_S = float(os.environ.get("DFV_THINK_HUM_S", "3.0"))
 THINK_GAP_S = float(os.environ.get("DFV_THINK_GAP_S", "2.5"))
 THINK_GAIN = float(os.environ.get("DFV_THINK_GAIN", "0.045"))           # ~-27 dBFS peak
+# Progress on long tool turns (2026-09-13; live call 10:40: a 146 s turn, the
+# Captain hung up at 22 s having heard only the filler and the hum). The
+# worker reports each tool call; we speak one line at most every
+# PROGRESS_EVERY_S, and a keep-alive if nothing has been said for KEEPALIVE_S.
+PROGRESS_EVERY_S = float(os.environ.get("DFV_PROGRESS_EVERY_S", "8"))
+KEEPALIVE_S = float(os.environ.get("DFV_KEEPALIVE_S", "20"))
+KEEPALIVE_LINE = os.environ.get("DFV_KEEPALIVE_LINE", "Still working on it, Captain.")
+BUSY_LINE = os.environ.get("DFV_BUSY_LINE", "Still finishing your last request, Captain. One moment.")
+# Follow-through after a hang-up: the in-flight turn runs to completion, the
+# FULL agent is asked to finish the request and write the report, and the
+# report goes to the Captain over iMessage via `hermes send` (the gateway's
+# own standalone delivery path, home channel from Hermes config — no
+# addresses here). FAST answers are texted only when substantive.
+FOLLOWUP = os.environ.get("DFV_FOLLOWUP", "on").lower() != "off"
+FOLLOWUP_TARGET = os.environ.get("DFV_FOLLOWUP_TARGET", "imessage")
+FOLLOWUP_MIN_FAST_CHARS = int(os.environ.get("DFV_FOLLOWUP_MIN_FAST_CHARS", "80"))
+HERMES_CLI = os.path.expanduser(os.environ.get("HERMES_CLI", "~/.hermes/hermes-agent/venv/bin/hermes"))
+FOLLOWUP_PROMPT = (
+    "[System notice: the FaceTime call has ENDED. The Captain hung up while you were "
+    "working on his last request: \"{request}\". His standing order: a task given on a "
+    "call is to be completed in full after he hangs up, then reported to him by text. "
+    "Step 1 - finish anything still undone (research, notes, reminders, files); verify "
+    "with your tools rather than assuming. Step 2 - reply with the exact text message he "
+    "will receive: plain text, no markdown, a few short lines; lead with what you did, "
+    "then what you found, with links where useful. If something could not be done, say "
+    "so plainly.]"
+)
 
 log = logging.getLogger("dfv")
 
@@ -236,7 +263,31 @@ class Worker:
             except Exception:
                 return 0
 
-    def stream(self, prompt: str, on_delta, on_filler, cancelled) -> str:
+    @property
+    def busy(self) -> bool:
+        """True while a turn (or a post-call follow-through) holds the worker."""
+        return self._lock.locked()
+
+    def followup(self, prompt: str) -> str:
+        """Post-call completion turn on the FULL agent, voice rules lifted."""
+        with self._lock:
+            if self._proc.poll() is not None:
+                self._spawn()
+            self._proc.stdin.write(json.dumps({"followup": True, "prompt": prompt}) + "\n")
+            self._proc.stdin.flush()
+            while True:
+                line = self._proc.stdout.readline()
+                if not line:
+                    raise RuntimeError("worker closed stdout")
+                msg = json.loads(line)
+                if "content" in msg:
+                    return msg["content"]
+                if "error" in msg:
+                    raise RuntimeError(msg["error"])
+                if "progress" in msg:
+                    log.info("follow-through: %s", msg.get("tool"))
+
+    def stream(self, prompt: str, on_delta, on_filler, cancelled, on_progress=None) -> str:
         """Run one turn. Calls on_delta(text) per delta; returns final text.
         If cancelled() becomes true, drains the rest of the turn quietly."""
         with self._lock:
@@ -256,6 +307,10 @@ class Worker:
                 elif "filler" in msg:
                     if not cancelled():
                         on_filler(msg["filler"])
+                elif "progress" in msg:
+                    log.info("tool: %s", msg.get("tool"))
+                    if on_progress is not None:
+                        on_progress(msg["progress"])
                 elif "content" in msg:
                     return msg["content"], msg.get("tier", "?")
                 elif "error" in msg:
@@ -420,6 +475,38 @@ class AudioSession:
 
 
 # ---------------------------------------------------------------------------
+# Delivery to the Captain when the call is over: `hermes send` is the gateway's
+# own standalone path (cron delivery uses it too) — imsg under the hood, home
+# channel from Hermes config. Undeliverable reports are kept under logs/.
+# ---------------------------------------------------------------------------
+def deliver_text(text: str) -> bool:
+    text = text.strip()
+    if not text:
+        return False
+    keep = LOG_DIR / "undelivered"
+    keep.mkdir(exist_ok=True)
+    path = keep / f"{time.strftime('%Y%m%d-%H%M%S')}.txt"
+    path.write_text(text + "\n")
+    t0 = time.perf_counter()
+    env = dict(os.environ)  # launchd's PATH has no Homebrew; imsg lives there
+    env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + env.get("PATH", "/usr/bin:/bin")
+    try:
+        r = subprocess.run([HERMES_CLI, "send", "--to", FOLLOWUP_TARGET, "--file", str(path), "--json"],
+                           capture_output=True, text=True, timeout=180, env=env)
+    except Exception as e:
+        log.error("deliver_text: hermes send failed to run: %s (kept %s)", e, path)
+        return False
+    ok = r.returncode == 0
+    if ok:
+        path.unlink(missing_ok=True)
+        log.info("delivered to %s in %.1fs (%d chars)", FOLLOWUP_TARGET, time.perf_counter() - t0, len(text))
+    else:
+        log.error("deliver_text: hermes send rc=%s out=%s err=%s (kept %s)", r.returncode,
+                  r.stdout.strip()[:300], r.stderr.strip()[:300], path)
+    return ok
+
+
+# ---------------------------------------------------------------------------
 # The call
 # ---------------------------------------------------------------------------
 class Call:
@@ -501,13 +588,20 @@ class Call:
                         if speech_ms >= MIN_SPEECH_MS:
                             self.utterances.put(np.concatenate(speech))
                         speech = []
+        if in_speech and speech_ms >= MIN_SPEECH_MS:
+            # Hung up mid-sentence: what he said still counts (converse runs on).
+            self.utterances.put(np.concatenate(speech))
 
     # ---- utterances → STT → LLM → TTS ------------------------------------
     def converse(self):
-        while not self.ended.is_set():
+        # Runs past the hang-up: whatever the Captain said before the line
+        # dropped is still his order (see follow_through).
+        while True:
             try:
                 utt = self.utterances.get(timeout=0.5)
             except queue.Empty:
+                if self.ended.is_set():
+                    break
                 continue
             # Latest wins: if several piled up during a long turn, keep the last.
             while not self.utterances.empty():
@@ -587,6 +681,8 @@ class Call:
             self.reopening = False
 
     def say(self, text: str):
+        if self.ended.is_set():
+            return
         pcm = self.tts.render(text)
         self.audio.play(pcm)
         log.info("DATA: %s", text)
@@ -597,6 +693,10 @@ class Call:
         spoken = 0
         t0 = time.perf_counter()
         first_audio = [None]
+        last_speech = [t0]          # when DATA last said anything (progress pacing)
+        if self.worker.busy and not self.ended.is_set():
+            # A previous call's follow-through still holds the worker.
+            self.say(BUSY_LINE)
 
         thinking_stop = threading.Event()
 
@@ -608,7 +708,7 @@ class Call:
             pattern = thinking_pattern()
             step = int(0.1 * BRIDGE_RATE)
             pos = 0
-            while not thinking_stop.is_set() and not self.barge.is_set():
+            while not thinking_stop.is_set() and not self.barge.is_set() and not self.ended.is_set():
                 if self.audio.playing:          # filler / stall line on air
                     time.sleep(0.1)
                     continue
@@ -622,11 +722,11 @@ class Call:
 
         def speak(s: str, filler: bool = False) -> bool:
             nonlocal spoken
-            if self.barge.is_set() or spoken >= MAX_SENTENCES:
+            if self.barge.is_set() or spoken >= MAX_SENTENCES or self.ended.is_set():
                 return False
             t = time.perf_counter()
             pcm = self.tts.render(s)
-            if self.barge.is_set():
+            if self.barge.is_set() or self.ended.is_set():
                 return False
             if not filler and not thinking_stop.is_set():
                 # First real sentence: end the hum and flush whatever slice is
@@ -635,7 +735,9 @@ class Call:
                 if THINKING_SOUND == "hum":
                     self.audio.clear()
             self.audio.play(pcm)
-            spoken += 1
+            if not filler:              # fillers/progress are not the answer
+                spoken += 1
+            last_speech[0] = time.perf_counter()
             if first_audio[0] is None:
                 first_audio[0] = time.perf_counter() - t0
                 stall_timer.cancel()
@@ -647,31 +749,59 @@ class Call:
                 if not speak(s):
                     break
 
+        def on_progress(line: str):
+            nonlocal spoken
+            # A tool call means whatever streamed so far was DATA narrating,
+            # not the answer: finish that thought and give the answer a fresh
+            # sentence budget, otherwise the narration eats the cap and the
+            # result is never spoken (call 2026-09-13 10:40).
+            for s in sentences.flush():
+                speak(s)
+            spoken = 0
+            if time.perf_counter() - last_speech[0] >= PROGRESS_EVERY_S:
+                speak(line, filler=True)
+
+        def keepalive():
+            # Nothing said for KEEPALIVE_S mid-turn (one long tool call, no
+            # progress events): say so. Fillers never count against the cap.
+            while not turn_over.wait(1.0):
+                if (not self.audio.playing and not self.barge.is_set()
+                        and time.perf_counter() - last_speech[0] >= KEEPALIVE_S):
+                    speak(KEEPALIVE_LINE, filler=True)
+        turn_over = threading.Event()
+        threading.Thread(target=keepalive, daemon=True, name="keepalive").start()
+
         def stall():
             # Provider is thinking (live call 2026-09-11 15:46: one FAST turn
             # took 13.2s to first token). Never leave the line dead that long.
-            if first_audio[0] is None and not self.barge.is_set():
+            if first_audio[0] is None and not self.barge.is_set() and not self.ended.is_set():
                 log.warning("no audio %.1fs into the turn — speaking stall line", STALL_AFTER_S)
                 self.audio.play(self.tts.render(STALL_LINE))
         stall_timer = threading.Timer(STALL_AFTER_S, stall)
         stall_timer.daemon = True
         stall_timer.start()
         tier = "?"
+        final = ""
         try:
             final, tier = self.worker.stream(user_text, on_delta, lambda f: speak(f, filler=True),
-                                             lambda: self.barge.is_set() or spoken >= MAX_SENTENCES)
+                                             lambda: self.barge.is_set() or spoken >= MAX_SENTENCES,
+                                             on_progress)
             for s in sentences.flush():
                 speak(s)
             final = clean_for_speech(final)
+            hung_up = self.ended.is_set()
             capped = spoken >= MAX_SENTENCES and sentences.buf.strip()
-            if capped and not self.barge.is_set():
+            if capped and not self.barge.is_set() and not hung_up:
                 # We cut the reply short on purpose; say so rather than trail off.
                 self.audio.play(self.tts.render(CAP_LINE))
             self.transcript.append(("assistant", final))
-            log.info("turn done [%s]: first audio %s, total %.2fs, %d sentence(s)%s", tier,
+            log.info("turn done [%s]: first audio %s, total %.2fs, %d sentence(s)%s%s", tier,
                      f"{first_audio[0]:.2f}s" if first_audio[0] else "none",
-                     time.perf_counter() - t0, spoken, " [barged]" if self.barge.is_set() else "")
-            if spoken == 0 and not self.barge.is_set():
+                     time.perf_counter() - t0, spoken, " [barged]" if self.barge.is_set() else "",
+                     " [after hang-up]" if hung_up else "")
+            if hung_up and not self.barge.is_set():
+                self.follow_through(user_text, final, tier)
+            elif spoken == 0 and not self.barge.is_set() and not hung_up:
                 self.say(LOST_LINE)
         except Exception as e:
             log.exception("turn failed: %s", e)
@@ -680,6 +810,31 @@ class Call:
         finally:
             stall_timer.cancel()
             thinking_stop.set()
+            turn_over.set()
+
+    # ---- after the hang-up -------------------------------------------------
+    def follow_through(self, user_text: str, final: str, tier: str):
+        """The Captain hung up before this turn finished. Tool turns: have the
+        FULL agent complete the request and write the report; text it to him.
+        Conversation turns: text the answer if there was one worth texting."""
+        if not FOLLOWUP:
+            return
+        if tier != "full":
+            if len(final.strip()) >= FOLLOWUP_MIN_FAST_CHARS:
+                deliver_text(f"You dropped off before I could answer, Captain.\n\n{final.strip()}")
+            return
+        t0 = time.perf_counter()
+        log.info("follow-through: completing %r after hang-up", user_text[:80])
+        try:
+            report = self.worker.followup(FOLLOWUP_PROMPT.format(request=user_text.replace('"', "'")))
+        except Exception as e:
+            log.exception("follow-through failed: %s", e)
+            report = ("I could not finish your last request after the call dropped, Captain: "
+                      f"{type(e).__name__}. Ask me again on iMessage and I'll take it from there.")
+        report = re.sub(r"<think>.*?</think>", "", report, flags=re.S).strip()
+        self.transcript.append(("assistant-followup", report))
+        log.info("follow-through done in %.1fs: %s", time.perf_counter() - t0, report[:200].replace("\n", " "))
+        deliver_text(report)
 
     # ---- lifecycle --------------------------------------------------------
     def watch_end(self):
@@ -710,13 +865,22 @@ class Call:
             workers.append(self.answer_watch)
         else:
             self.answered.set()
-        threads = [threading.Thread(target=f, daemon=True, name=f.__name__) for f in workers]
-        for t in threads:
+        threads = {f.__name__: threading.Thread(target=f, daemon=True, name=f.__name__) for f in workers}
+        for t in threads.values():
             t.start()
         self.ended.wait()
         self.audio.stop()
-        with open(LOG_DIR / "transcripts.jsonl", "a") as fh:
-            fh.write(json.dumps({"t": time.time(), "call_id": self.audio.call_id, "turns": self.transcript}) + "\n")
+
+        def finish():
+            # converse may still be completing the Captain's last order (and
+            # texting him); the transcript is written when it is truly done.
+            t = time.perf_counter()
+            threads["converse"].join()
+            if time.perf_counter() - t > 1.0:
+                log.info("post-call work finished %.0fs after the hang-up", time.perf_counter() - t)
+            with open(LOG_DIR / "transcripts.jsonl", "a") as fh:
+                fh.write(json.dumps({"t": time.time(), "call_id": self.audio.call_id, "turns": self.transcript}) + "\n")
+        threading.Thread(target=finish, daemon=True, name="finish").start()
 
 
 # ---------------------------------------------------------------------------

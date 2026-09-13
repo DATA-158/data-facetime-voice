@@ -37,8 +37,10 @@ Both agents share the conversation transcript, so DATA does not lose the thread
 when a turn switches tier.
 
 stdin:  {"prompt": "...", "stream": true} lines
+        {"refresh": true}                       reload cross-channel context
+        {"followup": true, "prompt": "..."}     post-call completion (text mode)
 stdout: {"status":"ready"} then {"delta": "..."} / {"filler": "..."} /
-        {"content": "...", "tier": "fast|full"} lines
+        {"progress": "...", "tool": "..."} / {"content": "...", "tier": "fast|full"} lines
 """
 import json
 import os
@@ -88,6 +90,58 @@ FULL_REASONING_EFFORT = os.environ.get(
 # Spoken the instant a turn routes to the tool-enabled agent, so the caller
 # hears acknowledgement rather than dead air while the tool loop runs.
 FILLER_LINE = os.environ.get("DFV_TOOL_FILLER", "Let me check that, Captain.")
+
+# 2026-09-13: progress past the filler. Tool turns run 7-150 s (live call
+# 10:40 today: 146 s), and the model streams no content while it works, so
+# after the filler the Captain heard only the hum — he hung up at 22 s. The
+# FULL agent's tool_start_callback now emits one short spoken line per tool
+# call; the voice loop rate-limits them (see voice_agent.PROGRESS_EVERY_S).
+_PROGRESS_LINES = {
+    "web_search": "Searching the web.",
+    "web_extract": "Reading a page.",
+    "web_fetch": "Reading a page.",
+    "browser": "Opening a page.",
+    "terminal": "Running a command.",
+    "execute_code": "Running a command.",
+    "read_file": "Reading a file.",
+    "write_file": "Writing that down.",
+    "patch": "Writing that down.",
+    "search_files": "Searching files.",
+    "memory": "Making a note of that.",
+    "session_search": "Checking our past conversations.",
+}
+_PROGRESS_DEFAULT = "Still working on it."
+
+
+def _progress_line(tool_name: str, args) -> str:
+    name = (tool_name or "").lower()
+    for key, line in _PROGRESS_LINES.items():
+        if name.startswith(key):
+            if key == "web_search" and isinstance(args, dict):
+                q = str(args.get("query") or "").strip()
+                if 0 < len(q.split()) <= 8:
+                    return f"Searching for {q.rstrip('.?!')}."
+            return line
+    return _PROGRESS_DEFAULT
+
+
+def _on_tool_start(tool_call_id, function_name, display_args=None, *_a, **_k):
+    sys.stdout.write(json.dumps({"progress": _progress_line(function_name, display_args),
+                                 "tool": str(function_name)}) + "\n")
+    sys.stdout.flush()
+
+
+# Post-call completion. The Captain's rule (2026-09-13): "if I say 'do this
+# thing' and hang up, DATA should proceed to do that thing completely, finish
+# it, and then iMessage me when it is finished." The voice loop lets the
+# in-flight turn run to the end, then sends this follow-up on the FULL agent
+# with the voice rules lifted; the reply is delivered as an iMessage.
+FOLLOWUP_SYSTEM_SUFFIX = (
+    "\n\nTHE CALL HAS ENDED. You are no longer speaking aloud: your next reply is "
+    "delivered to the Captain as an iMessage. The voice rules above (no URLs, "
+    "1-3 sentences) do NOT apply to it. Write plain text without markdown, up to "
+    "about eight short lines, links welcome."
+)
 
 # Routing to the tool tier. Deliberately a cheap local heuristic: an extra
 # classifier model call would cost more latency than the tool schema it avoids.
@@ -291,6 +345,7 @@ def _build_agent(toolsets, reasoning_effort):
         save_trajectories=False,
         platform="voice",
         user_name="Captain Spencer",
+        tool_start_callback=_on_tool_start if toolsets else None,
     )
 
 
@@ -368,6 +423,27 @@ def process_request(request: dict) -> dict:
                 "elapsed": round(time.perf_counter() - t0, 3)}
 
 
+def process_followup(request: dict) -> dict:
+    """Finish the Captain's last request after he hung up; return the iMessage text."""
+    prompt = request.get("prompt", "")
+    if not prompt:
+        return {"error": "empty prompt"}
+    t0 = time.perf_counter()
+    agent = _ensure_full()
+    voice_prompt = agent.ephemeral_system_prompt
+    try:
+        agent.ephemeral_system_prompt = (voice_prompt or _voice_system_prompt()) + FOLLOWUP_SYSTEM_SUFFIX
+        text = agent.chat(_stamp(prompt))
+        text = text if isinstance(text, str) else str(text)
+        _mirror_turn(_fast_agent, prompt, text)
+        return {"content": text, "tier": "full", "elapsed": round(time.perf_counter() - t0, 3)}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}", "tier": "full",
+                "elapsed": round(time.perf_counter() - t0, 3)}
+    finally:
+        agent.ephemeral_system_prompt = voice_prompt
+
+
 def main():
     # Pre-warm BOTH agents BEFORE announcing ready — construction + memory load
     # + toolset build happen here, not on the Captain's first words. (Measured
@@ -398,7 +474,10 @@ def main():
             sys.stdout.write(json.dumps({"refreshed": n}) + "\n")
             sys.stdout.flush()
             continue
-        response = process_request(request)
+        if request.get("followup"):
+            response = process_followup(request)
+        else:
+            response = process_request(request)
         sys.stdout.write(json.dumps(response) + "\n")
         sys.stdout.flush()
 

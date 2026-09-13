@@ -21,7 +21,8 @@ WHAT CHANGED FOR YOU ON A CALL
 - Every call start injects the last 24 h of our conversations from other channels (iMessage etc.) into your voice prompt — that's how you knew about the Flourish Excel. Answer from it before reaching for session_search.
 - Every prompt carries the current date/time; time questions never need a tool.
 - Replies are capped at 3 sentences and cut on barge-in; a filler plays on tool turns, a stall line after 3.5 s of silence.
-- Tool turns take 7–36 s. On the 08:22 call my last request ran 36 s and I had hung up before you answered (you found the $12.99 Flourish Excel link — send it to me on iMessage). Until this is fixed in the loop: on a long tool turn, say what you're doing, and if the call ends before you finish, text the result.
+- Tool turns take 7–150 s. While you work, the loop now speaks progress for you (one line per tool call, at most every 8 s; a keep-alive after 20 s of silence), and your own narration between tool calls is spoken too — so narrate briefly.
+- MY STANDING ORDER (2026-09-13): a task I give you on a call is finished after I hang up. The loop lets your turn run to completion, then sends you one more prompt ("the call has ended; finish anything undone, then write the text message") and delivers your reply to me on iMessage via `hermes send`. In that follow-up the voice rules are lifted: plain text, a few lines, links welcome, lead with what you did, then what you found. Verify with your tools that the note/reminder/file really exists before you say it does.
 
 YOUR MACHINE'S RESOURCES — WHAT CHANGED AND WHY
 
