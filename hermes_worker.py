@@ -36,7 +36,7 @@ instead of dead air while the tool loop runs.
 Both agents share the conversation transcript, so DATA does not lose the thread
 when a turn switches tier.
 
-stdin:  {"prompt": "...", "stream": true} lines
+stdin:  {"prompt": "...", "stream": true, "image": "/path.jpg"?} lines
         {"refresh": true}                       reload cross-channel context
         {"followup": true, "prompt": "..."}     post-call completion (text mode)
 stdout: {"status":"ready"} then {"delta": "..."} / {"filler": "..."} /
@@ -363,23 +363,54 @@ def _ensure_full():
     return _full_agent
 
 
-def _mirror_turn(agent, user_text: str, reply: str) -> None:
-    """Give the OTHER tier this turn so DATA keeps one continuous thread.
+# Conversation memory (2026-09-14). AIAgent keeps NO transcript between
+# chat() calls: each turn is a fresh conversation unless the caller passes
+# conversation_history= and takes result["messages"] back (that is what the
+# Hermes CLI does). Verified on this host: "my favorite number is 17" /
+# "what's my favorite number?" -> "you've never told me one". So every voice
+# turn until today stood alone; the old _mirror_turn wrote to an attribute
+# that does not exist. Now: one history per tier, threaded through each turn,
+# the other tier receives the user/assistant text of the exchange (its tool
+# messages would not be valid for a no-tool agent), kept across calls and
+# trimmed to HISTORY_MAX messages.
+HISTORY_MAX = int(os.environ.get("DFV_HISTORY_MAX", "30"))
+_histories: dict = {"fast": [], "full": []}
 
-    Without this, asking DATA to check the calendar (FULL) and then saying
-    "what did you just say?" (FAST) would hit an agent that never heard the
-    exchange. Best-effort: transcript shapes differ across Hermes versions, so
-    a failure here degrades continuity, never the call.
-    """
-    if agent is None or not reply:
-        return
-    try:
-        history = getattr(agent, "conversation_history", None)
-        if isinstance(history, list):
-            history.append({"role": "user", "content": user_text})
-            history.append({"role": "assistant", "content": reply})
-    except Exception:
-        pass
+
+def _remember(tier: str, messages, user_text: str, reply: str) -> None:
+    if isinstance(messages, list):
+        _histories[tier] = messages[-HISTORY_MAX:]
+    other = "fast" if tier == "full" else "full"
+    if reply:
+        _histories[other] += [{"role": "user", "content": user_text},
+                              {"role": "assistant", "content": reply}]
+        _histories[other] = _histories[other][-HISTORY_MAX:]
+
+
+# Camera frames (2026-09-14). The frame rides the turn as a native image part
+# (glm-5.3-flash is vision-capable per Hermes' catalog; image_input_mode auto
+# resolves to "native"). After the turn the base64 is dropped from the
+# history — a 1280 px frame is ~200 KB of prompt on every later turn — and
+# replaced by a one-line note, so DATA remembers he was shown something
+# without re-sending the pixels for the rest of the call.
+CAMERA_NOTE = ("(The Captain is on FaceTime VIDEO and is showing you his camera. The "
+               "attached frame is what he is pointing at right now; answer about it.)")
+
+
+def _with_image(prompt: str, image: str):
+    from agent.image_routing import build_native_content_parts
+    parts, skipped = build_native_content_parts(f"{CAMERA_NOTE} {prompt}", [image])
+    if skipped or not any(p.get("type") == "image_url" for p in parts):
+        sys.stderr.write(f"image not attached: {skipped}\n")
+        return prompt
+    return parts
+
+
+def _drop_image_from_history(tier: str, prompt: str) -> None:
+    for msg in reversed(_histories[tier]):
+        if msg.get("role") == "user" and isinstance(msg.get("content"), list):
+            msg["content"] = f"{prompt} [showed a camera frame]"
+            return
 
 
 def _stamp(prompt: str) -> str:
@@ -392,6 +423,8 @@ def process_request(request: dict) -> dict:
     if not prompt:
         return {"error": "empty prompt"}
     prompt = _stamp(prompt)
+    image = request.get("image")
+    message = _with_image(prompt, image) if image else prompt
     t0 = time.perf_counter()
     use_tools = needs_tools(prompt)
     tier = "full" if use_tools else "fast"
@@ -402,20 +435,21 @@ def process_request(request: dict) -> dict:
             sys.stdout.write(json.dumps({"filler": FILLER_LINE}) + "\n")
             sys.stdout.flush()
             agent = _ensure_full()
-            other = _fast_agent
         else:
             agent = _ensure_fast()
-            other = _full_agent
 
+        cb = None
         if request.get("stream"):
-            def _cb(delta: str) -> None:
+            def cb(delta: str) -> None:
                 sys.stdout.write(json.dumps({"delta": delta}) + "\n")
                 sys.stdout.flush()
-            text = agent.chat(prompt, stream_callback=_cb)
-        else:
-            text = agent.chat(prompt)
+        result = agent.run_conversation(message, conversation_history=list(_histories[tier]) or None,
+                                        stream_callback=cb)
+        text = result.get("final_response") or ""
         text = text if isinstance(text, str) else str(text)
-        _mirror_turn(other, prompt, text)
+        _remember(tier, result.get("messages"), prompt, text)
+        if image:
+            _drop_image_from_history(tier, prompt)
         return {"content": text, "tier": tier,
                 "elapsed": round(time.perf_counter() - t0, 3)}
     except Exception as e:
@@ -433,9 +467,10 @@ def process_followup(request: dict) -> dict:
     voice_prompt = agent.ephemeral_system_prompt
     try:
         agent.ephemeral_system_prompt = (voice_prompt or _voice_system_prompt()) + FOLLOWUP_SYSTEM_SUFFIX
-        text = agent.chat(_stamp(prompt))
+        result = agent.run_conversation(_stamp(prompt), conversation_history=list(_histories["full"]) or None)
+        text = result.get("final_response") or ""
         text = text if isinstance(text, str) else str(text)
-        _mirror_turn(_fast_agent, prompt, text)
+        _remember("full", result.get("messages"), prompt, text)
         return {"content": text, "tier": "full", "elapsed": round(time.perf_counter() - t0, 3)}
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}", "tier": "full",

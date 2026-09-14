@@ -119,6 +119,23 @@ FOLLOWUP = os.environ.get("DFV_FOLLOWUP", "on").lower() != "off"
 FOLLOWUP_TARGET = os.environ.get("DFV_FOLLOWUP_TARGET", "imessage")
 FOLLOWUP_MIN_FAST_CHARS = int(os.environ.get("DFV_FOLLOWUP_MIN_FAST_CHARS", "80"))
 HERMES_CLI = os.path.expanduser(os.environ.get("HERMES_CLI", "~/.hermes/hermes-agent/venv/bin/hermes"))
+# Camera (2026-09-14): on a FaceTime VIDEO call the Captain can show DATA
+# something and ask about it. A "look" question grabs one frame of the
+# FaceTime window through the daemon's Snapshot RPC (the daemon can capture
+# nothing else) and attaches it to that turn. Frames live only for the turn
+# unless DFV_KEEP_FRAMES=1.
+VISION = os.environ.get("DFV_VISION", "on").lower() != "off"
+FRAME_MAX_SIDE = int(os.environ.get("DFV_FRAME_MAX_SIDE", "1280"))
+KEEP_FRAMES = os.environ.get("DFV_KEEP_FRAMES", "0") == "1"
+FRAME_DIR = Path(os.environ.get("DFV_FRAME_DIR", "~/.facetime-bridge/frames")).expanduser()
+_LOOK = re.compile(
+    r"\b(what(?:'s| is| are)? (?:this|that|these|those)\b|can you see|do you see|(?:take a )?look at "
+    r"(?:this|that|my|the)|what am i (?:holding|showing|looking at)|what (?:kind|sort|type) of|"
+    r"what (?:flower|plant|bird|animal|bug|insect|tree|mushroom|fish|dog|cat|car|part|tool|"
+    r"brand|model|color|colour) is|read (?:this|that|the label|the sign|it)|what does (?:this|that|it) say|"
+    r"identify (?:this|that|it)|which (?:flower|plant|one)|on (?:my )?camera|(?:my |the )?screen|"
+    r"in (?:my )?hand|how does (?:this|that|it) look|is this)\b",
+    re.IGNORECASE)
 FOLLOWUP_PROMPT = (
     "[System notice: the FaceTime call has ENDED. The Captain hung up while you were "
     "working on his last request: \"{request}\". His standing order: a task given on a "
@@ -298,14 +315,17 @@ class Worker:
                 if "progress" in msg:
                     log.info("follow-through: %s", msg.get("tool"))
 
-    def stream(self, prompt: str, on_delta, on_filler, cancelled, on_progress=None) -> str:
+    def stream(self, prompt: str, on_delta, on_filler, cancelled, on_progress=None, image: str | None = None) -> str:
         """Run one turn. Calls on_delta(text) per delta; returns final text.
         If cancelled() becomes true, drains the rest of the turn quietly."""
         with self._lock:
             if self._proc.poll() is not None:
                 log.warning("worker died; respawning")
                 self._spawn()
-            self._proc.stdin.write(json.dumps({"prompt": prompt, "stream": True}) + "\n")
+            req = {"prompt": prompt, "stream": True}
+            if image:
+                req["image"] = image
+            self._proc.stdin.write(json.dumps(req) + "\n")
             self._proc.stdin.flush()
             while True:
                 line = self._proc.stdout.readline()
@@ -398,6 +418,24 @@ class Bridge:
         except grpc.RpcError as e:
             log.warning("probe failed: %s", e.code())
             return None
+
+    def snapshot(self, max_side: int = FRAME_MAX_SIDE) -> Path | None:
+        """One JPEG of the FaceTime window (the caller's camera), or None."""
+        t = time.perf_counter()
+        try:
+            r = self.stub.Snapshot(pb.SnapshotRequest(max_side=max_side), timeout=10)
+        except grpc.RpcError as e:
+            log.warning("snapshot failed: %s", e.code())
+            return None
+        if not r.ok:
+            log.warning("snapshot refused: %s %s", r.error_code, r.message)
+            return None
+        FRAME_DIR.mkdir(parents=True, exist_ok=True)
+        path = FRAME_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}.jpg"
+        path.write_bytes(r.jpeg)
+        log.info("frame %dx%d %d KB in %.0fms (%s)", r.width, r.height, len(r.jpeg) // 1024,
+                 (time.perf_counter() - t) * 1000, r.window_title or "FaceTime")
+        return path
 
 
 def thinking_pattern() -> np.ndarray:
@@ -631,13 +669,20 @@ class Call:
                 continue
             log.info("Captain: %s  (STT %.0fms, %.1fs audio)", text, t_stt * 1000, len(utt) / STT_RATE)
             self.transcript.append(("user", text))
+            frame = None
+            if VISION and not self.simulate and _LOOK.search(text):
+                frame = self.bridge.snapshot()
             if not self.greeted:
                 # Speech before the ringback detector fired: that IS the answer.
                 self.answered.set()
                 self.on_answered()
                 if re.fullmatch(r"[\s\W]*(hello|hi|hey|yo|data|you there|are you there)[\s\W]*", text, re.I):
                     continue
-            self.turn(text)
+            try:
+                self.turn(text, frame)
+            finally:
+                if frame is not None and not KEEP_FRAMES:
+                    frame.unlink(missing_ok=True)
 
     def on_answered(self):
         """Outbound only. The stream we listened on was opened pre-answer and
@@ -701,7 +746,7 @@ class Call:
         self.audio.play(pcm)
         log.info("DATA: %s", text)
 
-    def turn(self, user_text: str):
+    def turn(self, user_text: str, frame: Path | None = None):
         self.barge.clear()
         sentences = SentenceBuffer()
         spoken = 0
@@ -817,7 +862,7 @@ class Call:
         try:
             final, tier = self.worker.stream(user_text, on_delta, lambda f: speak(f, filler=True),
                                              lambda: self.barge.is_set() or spoken >= MAX_SENTENCES,
-                                             on_progress)
+                                             on_progress, image=str(frame) if frame else None)
             for s in sentences.flush():
                 speak(s)
             final = clean_for_speech(final)
@@ -871,6 +916,7 @@ class Call:
     def watch_end(self):
         """Poll the daemon; two consecutive idle/ended scans end the call."""
         misses = 0
+        last_state = None
         while not self.ended.is_set():
             time.sleep(2.0)
             if self.audio.closed.is_set() and not self.reopening:
@@ -882,6 +928,9 @@ class Call:
             r = self.bridge.probe()
             if r is None:
                 continue
+            if r.state != last_state:
+                log.info("probe: %s authorized=%s", r.state, r.authorized)
+                last_state = r.state
             if r.state in ("idle", "ended"):
                 misses += 1
                 if misses >= 2:

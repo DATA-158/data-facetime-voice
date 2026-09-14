@@ -54,6 +54,11 @@ class FaceTimeMediaStub:
                 request_serializer=facetime__media__pb2.AudioPacket.SerializeToString,
                 response_deserializer=facetime__media__pb2.AudioPacket.FromString,
                 _registered_method=True)
+        self.Snapshot = channel.unary_unary(
+                '/facetimebridge.v1.FaceTimeMedia/Snapshot',
+                request_serializer=facetime__media__pb2.SnapshotRequest.SerializeToString,
+                response_deserializer=facetime__media__pb2.SnapshotResponse.FromString,
+                _registered_method=True)
 
 
 class FaceTimeMediaServicer:
@@ -83,6 +88,14 @@ class FaceTimeMediaServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def Snapshot(self, request, context):
+        """One JPEG of the FaceTime window (the caller's camera). The filter is the
+        FaceTime window only — no other screen content can be returned.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_FaceTimeMediaServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -105,6 +118,11 @@ def add_FaceTimeMediaServicer_to_server(servicer, server):
                     servicer.Audio,
                     request_deserializer=facetime__media__pb2.AudioPacket.FromString,
                     response_serializer=facetime__media__pb2.AudioPacket.SerializeToString,
+            ),
+            'Snapshot': grpc.unary_unary_rpc_method_handler(
+                    servicer.Snapshot,
+                    request_deserializer=facetime__media__pb2.SnapshotRequest.FromString,
+                    response_serializer=facetime__media__pb2.SnapshotResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -215,6 +233,33 @@ class FaceTimeMedia:
             '/facetimebridge.v1.FaceTimeMedia/Audio',
             facetime__media__pb2.AudioPacket.SerializeToString,
             facetime__media__pb2.AudioPacket.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Snapshot(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/facetimebridge.v1.FaceTimeMedia/Snapshot',
+            facetime__media__pb2.SnapshotRequest.SerializeToString,
+            facetime__media__pb2.SnapshotResponse.FromString,
             options,
             channel_credentials,
             insecure,
